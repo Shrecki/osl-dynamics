@@ -175,14 +175,18 @@ def test_ll_mask_full_equals_no_mask():
     
     model = Model(config)
     
-    mask = np.ones(1000,dtype=bool)
+    mask = model.make_dataset(np.ones(10000,dtype=bool), concatenate=True)
     
     ll_mask_none = []
-    for data in dataset:
-        x = data["data"]
-        ll_1 = model.get_likelihood(x,mask)
+    i = 0
+    
+    #dataset_numpy = dataset.as_numpy_iterator()
+    for i,e in enumerate(dataset.as_numpy_iterator()):
+        x = e["data"]
+        m = list(mask.as_numpy_iterator())[i]["data"]
+        ll_1 = model.get_likelihood(x,m)
         ll_mask_none.append(ll_1)
-        
+        i+=1
     ll_mask_none = np.concatenate(ll_mask_none)
     
     # Required to free resources and be able to run multiple models back to back

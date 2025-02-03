@@ -661,7 +661,7 @@ class Model(ModelBase):
             )
             log_likelihood[state] = mvn.log_prob(x)
             if ll_masks is not None:
-                log_likelihood[state] = log_likelihood[state] * ll_masks
+                log_likelihood[state] = log_likelihood[state] * ll_masks[:,:,0]
         log_likelihood = log_likelihood.reshape(n_states, batch_size * sequence_length)
         
 
