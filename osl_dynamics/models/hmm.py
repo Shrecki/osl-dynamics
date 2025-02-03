@@ -147,6 +147,9 @@ class Config(BaseModelConfig):
     trans_prob_update_delay: float = 5  # alpha
     trans_prob_update_forget: float = 0.7  # beta
     observation_update_decay: float = 0.1
+    
+    # Use masking or not
+    use_mask: bool = False
 
     def __post_init__(self):
         self.validate_observation_model_parameters()
