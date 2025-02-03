@@ -1541,6 +1541,84 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
         self.add_metric(nll_loss, name=self.name)
 
         return tf.expand_dims(nll_loss, axis=-1)
+    
+class CategoricalLogLikelihoodLossLayerMasked(layers.Layer):
+    """Layer to calculate the log-likelihood loss assuming a categorical model.
+
+    Parameters
+    ----------
+    n_states : int
+        Number of states.
+    epsilon : float
+        Error added to the covariances for numerical stability.
+    calculation : str
+        Operation for reducing the time dimension. Either 'mean' or 'sum'.
+    kwargs : keyword arguments, optional
+        Keyword arguments to pass to the base class.
+    """
+
+    def __init__(self, n_states, epsilon, calculation, **kwargs):
+        super().__init__(**kwargs)
+        self.n_states = n_states
+        self.epsilon = epsilon
+        self.calculation = calculation
+
+    def call(self, inputs, **kwargs):
+        # Expect inputs to be: x, mu, sigma, probs, mask
+        x, mu, sigma, probs, session_id, mask = inputs
+
+        # Add a small error for numerical stability
+        sigma = add_epsilon(sigma, self.epsilon, diag=True)
+
+        if session_id is not None:
+            # Get the mean and covariance for the requested array
+            session_id = tf.cast(session_id, tf.int32)
+            mu = tf.gather(mu, session_id)
+            sigma = tf.gather(sigma, session_id)
+
+        # Log-likelihood for each state
+        ll_loss = tf.zeros(shape=tf.shape(x)[:-1])
+        for i in range(self.n_states):
+            mvn = tfp.distributions.MultivariateNormalTriL(
+                loc=tf.gather(mu, i, axis=-2),
+                scale_tril=tf.linalg.cholesky(tf.gather(sigma, i, axis=-3)),
+                allow_nan_stats=False,
+            )
+            a = mvn.log_prob(x)
+            ll_loss += probs[:, :, i] * a
+
+        # For time points where mask == 0, log-likelihood to be set to 0 (since log(1)=0)
+        # i.e., to contribute nothing.
+        if mask is not None:
+            # Ensure that mask is of type float and broadcastable to ll_loss
+            mask = tf.cast(mask, ll_loss.dtype)
+            ll_loss = ll_loss * mask
+
+            # To normalize properly, sum only over valid time points.
+            if self.calculation == "sum":
+                total_valid = tf.reduce_sum(mask, axis=1)
+                # Sum over time dimension and average over the batch dimension
+                ll_loss = tf.reduce_sum(ll_loss, axis=1) / (total_valid + 1e-10)
+                ll_loss = tf.reduce_mean(ll_loss, axis=0)
+            else: 
+                # Average over time and batches
+                total_valid = tf.reduce_sum(mask, axis=(0, 1))
+                ll_loss = tf.reduce_sum(ll_loss, axis=(0, 1)) / (total_valid + 1e-10) # To verify, this looks fishy
+        else:
+            # No mask provided: compute as before.
+            if self.calculation == "sum":
+                ll_loss = tf.reduce_sum(ll_loss, axis=1)
+                ll_loss = tf.reduce_mean(ll_loss, axis=0)
+            else:
+                ll_loss = tf.reduce_mean(ll_loss, axis=(0, 1))
+
+        # The negative log likelihood loss:
+        nll_loss = -ll_loss
+        self.add_loss(nll_loss)
+        self.add_metric(nll_loss, name=self.name)
+
+        return tf.expand_dims(nll_loss, axis=-1)
+
 
 
 class CategoricalPoissonLogLikelihoodLossLayer(layers.Layer):

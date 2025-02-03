@@ -36,6 +36,7 @@ import osl_dynamics.data.tf as dtf
 from osl_dynamics.inference import initializers, modes
 from osl_dynamics.inference.layers import (
     CategoricalLogLikelihoodLossLayer,
+    CategoricalLogLikelihoodLossLayerMasked,
     CovarianceMatricesLayer,
     DiagonalMatricesLayer,
     VectorsLayer,
@@ -201,6 +202,7 @@ class Model(ModelBase):
         checkpoint_freq=None,
         save_filepath=None,
         dfo_tol=None,
+        ll_masks = None,
         verbose=1,
         **kwargs,
     ):
@@ -228,6 +230,12 @@ class Model(ModelBase):
             When the maximum fractional occupancy change (from epoch to epoch)
             is less than this value, we stop the training. If :code:`None`
             there is no early stopping.
+        ll_masks: np.ndarray of bools, optional (default is None)
+            Mask of points to consider in computation of log likelihood.
+            Points ignored will have LL set to 0, such that they do not contribute
+            (equivalent to marginalizing them out). If :code:`None`, all points
+            are included. To use this option, make sure that you set :code:`use_mask=True`
+            when setting up your model Config.
         verbose : int, optional
             Verbosity level. :code:`0=silent`.
         kwargs : keyword arguments, optional
@@ -292,7 +300,7 @@ class Model(ModelBase):
                 x = data["data"]
 
                 # Update state probabilities
-                gamma, xi = self.get_posterior(x)
+                gamma, xi = self.get_posterior(x,ll_masks=ll_masks)
 
                 # Update transition probability matrix
                 if self.config.learn_trans_prob:
@@ -308,7 +316,11 @@ class Model(ModelBase):
 
                 # Update observation model
                 x_and_gamma = np.concatenate([x, gamma], axis=2)
-                h = self.model.fit(x_and_gamma, epochs=1, verbose=0, **kwargs)
+                h = None
+                if ll_masks is None: 
+                    h = self.model.fit(x_and_gamma, epochs=1, verbose=0, **kwargs)
+                else:
+                    h = self.model.fit([x_and_gamma, ll_masks], epochs=1, verbose=0, **kwargs)
 
                 # Get new loss
                 l = h.history["loss"][0]
@@ -523,13 +535,17 @@ class Model(ModelBase):
 
         return best_history
 
-    def get_posterior(self, x):
+    def get_posterior(self, x, ll_masks=None):
         """Get marginal and joint posterior.
 
         Parameters
         ----------
         x : np.ndarray
             Observed data. Shape is (batch_size, sequence_length, n_channels).
+        ll_masks: np.ndarray of bools,optional
+            Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
+            Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
+            If None, all points are considered
 
         Returns
         -------
@@ -541,7 +557,7 @@ class Model(ModelBase):
             time points, :math:`q(s_t, s_{t+1})`. Shape is
             (batch_size*sequence_length-1, n_states*n_states).
         """
-        B = self.get_likelihood(x)
+        B = self.get_likelihood(x, ll_masks=ll_masks)
         Pi_0 = self.state_probs_t0
         P = self.trans_prob
         return self.baum_welch(B, Pi_0, P)
@@ -605,13 +621,17 @@ class Model(ModelBase):
 
         return gamma, xi
 
-    def get_likelihood(self, x):
+    def get_likelihood(self, x, ll_masks = None):
         """Get the likelihood, :math:`p(x_t | s_t)`.
 
         Parameters
         ----------
         x : np.ndarray
             Observed data. Shape is (batch_size, sequence_length, n_channels).
+        ll_masks: np.ndarray of bools,optional
+            Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
+            Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
+            If None, all points are considered
 
         Returns
         -------
@@ -637,7 +657,10 @@ class Model(ModelBase):
                 )
             )
             log_likelihood[state] = mvn.log_prob(x)
+            if ll_masks is not None:
+                log_likelihood[state] = log_likelihood[state] * ll_masks
         log_likelihood = log_likelihood.reshape(n_states, batch_size * sequence_length)
+        
 
         # We add a constant to the log-likelihood for time points where all
         # states have a negative log-likelihood. This is critical for numerical
@@ -1094,7 +1117,7 @@ class Model(ModelBase):
                 self.config.diagonal_covariances,
             )
 
-    def free_energy(self, dataset):
+    def free_energy(self, dataset,ll_masks=None):
         """Get the variational free energy.
 
         This calculates:
@@ -1108,6 +1131,10 @@ class Model(ModelBase):
         ----------
         dataset : tf.data.Dataset or osl_dynamics.data.Data
             Dataset to evaluate the free energy for.
+        ll_masks: np.ndarray of bools,optional
+            Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
+            Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
+            If None, all points are considered
 
         Returns
         -------
@@ -1126,7 +1153,7 @@ class Model(ModelBase):
             batch_size = x.shape[0]
 
             # Get the marginal and join posterior to calculate the free energy
-            gamma, xi = self.get_posterior(x)
+            gamma, xi = self.get_posterior(x,ll_masks=ll_masks)
 
             # Calculate the free energy:
             #
@@ -1271,7 +1298,7 @@ class Model(ModelBase):
 
         return evidence
 
-    def get_alpha(self, dataset, concatenate=False, remove_edge_effects=False):
+    def get_alpha(self, dataset, concatenate=False, remove_edge_effects=False, ll_masks=None):
         """Get state probabilities.
 
         Parameters
@@ -1293,6 +1320,10 @@ class Model(ModelBase):
         alpha : list or np.ndarray
             State probabilities with shape (n_sessions, n_samples, n_states)
             or (n_samples, n_states).
+        ll_masks: np.ndarray of bools,optional
+            Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
+            Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
+            If None, all points are considered
         """
         if remove_edge_effects:
             step_size = self.config.sequence_length // 2  # 50% overlap
@@ -1315,7 +1346,7 @@ class Model(ModelBase):
             for j, data in enumerate(dataset[i]):
                 n_batches = dtf.get_n_batches(dataset[i])
                 x = data["data"]
-                g, _ = self.get_posterior(x)
+                g, _ = self.get_posterior(x,ll_masks=ll_masks)
                 if remove_edge_effects:
                     batch_size, sequence_length, _ = x.shape
                     n_states = g.shape[-1]
@@ -1479,6 +1510,7 @@ class Model(ModelBase):
         learning_rate=None,
         dfo_tol=None,
         store_dir="tmp",
+        ll_masks=None
     ):
         """Fine tuning the model for each session.
 
@@ -1502,6 +1534,10 @@ class Model(ModelBase):
             there is no early stopping.
         store_dir : str, optional
             Directory to temporarily store the model in.
+        ll_masks: np.ndarray of bools,optional
+            Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
+            Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
+            If None, all points are considered
 
         Returns
         -------
@@ -1538,7 +1574,7 @@ class Model(ModelBase):
                 # Train on this session
                 with training_data.set_keep(i):
                     self.fit(training_data, dfo_tol=dfo_tol, verbose=0)
-                    a = self.get_alpha(training_data, concatenate=True)
+                    a = self.get_alpha(training_data, concatenate=True,ll_masks=ll_masks)
 
                 # Get the inferred parameters
                 m, c = self.get_means_covariances()
@@ -1557,7 +1593,7 @@ class Model(ModelBase):
 
         return alpha, np.array(means), np.array(covariances)
 
-    def dual_estimation(self, training_data, alpha=None, n_jobs=1):
+    def dual_estimation(self, training_data, alpha=None, n_jobs=1, ll_masks=None):
         """Dual estimation to get session-specific observation model parameters.
 
         Here, we estimate the state means and covariances for sessions
@@ -1572,6 +1608,10 @@ class Model(ModelBase):
             (n_sessions, n_samples, n_states).
         n_jobs : int, optional
             Number of jobs to run in parallel.
+        ll_masks: np.ndarray of bools,optional
+            Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
+            Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
+            If None, all points are considered
 
         Returns
         -------
@@ -1583,7 +1623,7 @@ class Model(ModelBase):
         """
         if alpha is None:
             # Get the posterior
-            alpha = self.get_alpha(training_data, concatenate=False)
+            alpha = self.get_alpha(training_data, concatenate=False, ll_masks=ll_masks)
 
         if isinstance(alpha, np.ndarray):
             alpha = [alpha]
@@ -1781,13 +1821,8 @@ class Model(ModelBase):
                 config.covariances_regularizer,
                 name="covs",
             )
-        ll_loss_layer = CategoricalLogLikelihoodLossLayer(
-            config.n_states,
-            config.covariances_epsilon,
-            config.loss_calc,
-            name="ll_loss",
-        )
-
+            
+            
         # Data flow
         data, gamma = tf.split(inputs, [config.n_channels, config.n_states], axis=2)
         static_loss_scaling_factor = static_loss_scaling_factor_layer(data)
@@ -1797,6 +1832,32 @@ class Model(ModelBase):
         D = covs_layer(
             data, static_loss_scaling_factor=static_loss_scaling_factor
         )  # data not used
-        ll_loss = ll_loss_layer([data, mu, D, gamma, None])
+        
+        ll_loss_layer = None
+        ll_loss = None
+        model = None
+        if config.use_mask:
+            ll_loss_layer = CategoricalLogLikelihoodLossLayer(
+                config.n_states,
+                config.covariances_epsilon,
+                config.loss_calc,
+                name="ll_loss",
+            )
+            ll_loss = ll_loss_layer([data, mu, D, gamma, None])
+            model = tf.keras.Model(inputs=inputs, outputs=[ll_loss], name="HMM")
 
-        return tf.keras.Model(inputs=inputs, outputs=[ll_loss], name="HMM")
+        else:
+            ll_loss_layer = CategoricalLogLikelihoodLossLayerMasked(
+                config.n_states,
+                config.covariances_epsilon,
+                config.loss_calc,
+                name="ll_loss",
+            )
+            
+            mask_input = layers.Input(
+                shape=(config.sequence_length, 1),
+                name="mask",
+            )
+            ll_loss = ll_loss_layer([data, mu, D, gamma, None, mask_input])
+            model = tf.keras.Model(inputs=[inputs, mask_input], outputs=[ll_loss], name="HMM")
+        return model
