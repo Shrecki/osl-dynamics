@@ -554,7 +554,7 @@ class Model(ModelBase):
         return best_history
 
     @numba.jit
-    def override_gamma(gamma, forced_states):
+    def override_gamma(self,gamma, forced_states):
         if forced_states is not None:
             # edit gamma
             T, n_states = gamma.shape
@@ -569,7 +569,7 @@ class Model(ModelBase):
         return gamma
     
     @numba.jit
-    def override_xi(xi, forced_states):
+    def override_xi(self,xi, forced_states):
         if forced_states is not None:
             # edit gamma
             T_minus1, n_states, _ = xi.shape

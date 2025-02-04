@@ -14,6 +14,7 @@ from osl_dynamics.simulation import HMM_MVN
 
 import tensorflow as tf
 import keras
+import copy
 
 def test_ll_mask_none_equals_no_mask():
     """The log likelihood of a data under 
@@ -511,3 +512,102 @@ def test_posterior_marginal_masked():
     # In the samples which are censored (t=400 to 699), the posterior is driven only by the transition matrix
     ####
     assert np.allclose(gammas_censored[400:600], gammas_censored[399:599] @ random_T)
+    
+    
+    
+def test_override_gamma_with_None_is_idop():
+    """
+    When the state sequence is None, we expect to get back exactly original gamma
+    """
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask= True,
+        
+    )
+    
+    model = Model(config)
+    
+    gamma = np.random.randn(1000*30, 5)
+    gamma_corr = model.override_gamma(copy.deepcopy(gamma), None)
+    
+    # We assume EXACT equality
+    assert np.all(gamma ==gamma_corr)
+    
+def test_override_gamma_with_NegStateSeq():
+    """
+    When the state sequence is negative, we expect to get back exactly original gamma
+    """
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask= True,
+        
+    )
+    
+    model = Model(config)
+    
+    gamma = np.random.randn(1000*30, 5)
+    state_seq = np.ones(1000*30)*(-1)
+    gamma_corr = model.override_gamma(copy.deepcopy(gamma), state_seq)
+    
+    # We assume EXACT equality
+    assert np.all(gamma ==gamma_corr)
+    
+def test_override_gamma_proper():
+    """
+    When the state sequence is non-negative, we expect to get back hard state assignments
+    within assigned states
+    """
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask= True,
+        
+    )
+    
+    model = Model(config)
+    
+    gamma = np.random.randn(1000*30, 3)
+    state_seq = np.ones(1000*30,dtype=int)*(-1)
+    state_seq[200:250] = 0
+    state_seq[400:860] = 2
+    state_seq[900:920] = 1
+    
+    gamma_corr = model.override_gamma(copy.deepcopy(gamma), state_seq)
+    
+    # We assume EXACT equality outside corrected gammas
+    unmodified_mask = state_seq < 0
+    assert np.all(gamma[unmodified_mask] ==gamma_corr[unmodified_mask])
+    
+    # Within mask, verify probas of states, should be 1 for selected state
+    # 0 otherwise
+    assert np.all(gamma_corr[state_seq == 0][:,0] == 1)
+    assert np.all(gamma_corr[state_seq == 0][:,1:] == 0)
+    
+    assert np.all(gamma_corr[state_seq == 2][:,2] == 1)
+    assert np.all(gamma_corr[state_seq == 2][:,:2] == 0)
+    
+    assert np.all(gamma_corr[state_seq == 1][:,1] == 1)
+    assert np.all(gamma_corr[state_seq == 1][:,[0,2]] == 0)
