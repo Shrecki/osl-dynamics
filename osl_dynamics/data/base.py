@@ -582,6 +582,7 @@ class Data:
         pca_components=None,
         whiten=False,
         use_raw=False,
+        component_offset=0
     ):
         """Principal component analysis (PCA).
 
@@ -600,6 +601,8 @@ class Data:
             Should we whiten the PCA'ed data?
         use_raw : bool, optional
             Should we prepare the original 'raw' data that we loaded?
+        component_offset: int, optional
+            From which offset should we include components
 
         Returns
         -------
@@ -610,12 +613,18 @@ class Data:
             n_pca_components is not None and pca_components is not None
         ):
             raise ValueError("Please pass either n_pca_components or pca_components.")
+        
+        if component_offset < 0:
+            raise ValueError("Please pass a non-negative component_offset.")
+        if not isinstance((component_offset, int)):
+            raise ValueError("component_offset must be a non-negative integer.")
 
         if pca_components is not None and not isinstance(pca_components, np.ndarray):
             raise ValueError("pca_components must be a numpy array.")
 
         self.n_pca_components = n_pca_components
         self.pca_components = pca_components
+        self.component_offset = component_offset
         self.whiten = whiten
 
         # What data should we apply PCA to?
@@ -632,10 +641,10 @@ class Data:
 
             # Use SVD on the covariance to calculate PCA components
             u, s, vh = np.linalg.svd(covariance)
-            u = u[:, :n_pca_components].astype(np.float32)
-            self.explained_variance = np.sum(s[:n_pca_components]) / np.sum(s)
+            u = u[:, component_offset:component_offset+n_pca_components].astype(np.float32)
+            self.explained_variance = np.sum(s[component_offset:component_offset+n_pca_components]) / np.sum(s)
             _logger.info(f"Explained variance: {100 * self.explained_variance:.1f}%")
-            s = s[:n_pca_components].astype(np.float32)
+            s = s[component_offset:component_offset+n_pca_components].astype(np.float32)
             if whiten:
                 u = u @ np.diag(1.0 / np.sqrt(s))
             self.pca_components = u
@@ -721,6 +730,7 @@ class Data:
         pca_components=None,
         whiten=False,
         use_raw=False,
+        component_offset=0
     ):
         """Time-delay embedding (TDE) and principal component analysis (PCA).
 
@@ -743,6 +753,8 @@ class Data:
             Should we whiten the PCA'ed data?
         use_raw : bool, optional
             Should we prepare the original 'raw' data that we loaded?
+        component_offset: int, optional
+            From which offset should we include components
 
         Returns
         -------
@@ -756,11 +768,19 @@ class Data:
 
         if pca_components is not None and not isinstance(pca_components, np.ndarray):
             raise ValueError("pca_components must be a numpy array.")
+        
+        
+        if component_offset < 0:
+            raise ValueError("Please pass a non-negative component_offset.")
+        if not isinstance((component_offset, int)):
+            raise ValueError("component_offset must be a non-negative integer.")
+
 
         self.n_embeddings = n_embeddings
         self.n_pca_components = n_pca_components
         self.pca_components = pca_components
         self.whiten = whiten
+        self.component_offset = component_offset
 
         # What data should we use?
         arrays = self.raw_data_arrays if use_raw else self.arrays
@@ -777,10 +797,10 @@ class Data:
 
             # Use SVD on the covariance to calculate PCA components
             u, s, vh = np.linalg.svd(covariance)
-            u = u[:, :n_pca_components].astype(np.float32)
-            self.explained_variance = np.sum(s[:n_pca_components]) / np.sum(s)
+            u = u[:, component_offset:component_offset+n_pca_components].astype(np.float32)
+            self.explained_variance = np.sum(s[component_offset:component_offset+n_pca_components]) / np.sum(s)
             _logger.info(f"Explained variance: {100 * self.explained_variance:.1f}%")
-            s = s[:n_pca_components].astype(np.float32)
+            s = s[component_offset:component_offset+n_pca_components].astype(np.float32)
             if whiten:
                 u = u @ np.diag(1.0 / np.sqrt(s))
             self.pca_components = u
