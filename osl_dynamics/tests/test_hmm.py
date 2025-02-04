@@ -12,6 +12,7 @@ from osl_dynamics.models.hmm import Config, Model
 from osl_dynamics.data import Data
 from osl_dynamics.simulation import HMM_MVN
 
+import tensorflow as tf
 import keras
 
 def test_ll_mask_none_equals_no_mask():
@@ -175,15 +176,17 @@ def test_ll_mask_full_equals_no_mask():
     
     model = Model(config)
     
-    mask = model.make_dataset(np.ones(10000,dtype=bool), concatenate=True)
+    mask = np.ones(10000,dtype=bool)
+    mask_dataset = model.make_dataset(mask, concatenate=True)
+    
+    combined_dataset = tf.data.Dataset.zip((dataset, mask_dataset))
     
     ll_mask_none = []
     i = 0
     
-    #dataset_numpy = dataset.as_numpy_iterator()
-    for i,e in enumerate(dataset.as_numpy_iterator()):
-        x = e["data"]
-        m = list(mask.as_numpy_iterator())[i]["data"]
+    for data_item, mask_item in combined_dataset:
+        x = data_item["data"]
+        m = mask_item["data"]
         ll_1 = model.get_likelihood(x,m)
         ll_mask_none.append(ll_1)
         i+=1
@@ -198,16 +201,313 @@ def test_ll_under_mask_equals_no_mask():
     """The log likelihood of the considered points
     must be exactly equal to the log likelihood of the non masked data
     """
-    assert True == False
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    random_means = np.random.randn(3,10)
+        
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=False,
+        learn_covariances=False,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=1,
+        multi_gpu = False,
+        use_mask= False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T
+    )
+    
+    model = Model(config)
 
-def test_ll_out_mask_zero():
+    data = Data([np.random.randn(10000, 10)],time_axis_first=True, sampling_frequency=250.0)
+    dataset = model.make_dataset(data, concatenate=True)
+
+    # Get likelihood
+    ll_base = []
+    for data in dataset:
+        x = data["data"]
+        ll_1 = model.get_likelihood(x)
+        ll_base.append(ll_1)
+    ll_base = np.concatenate(ll_base)
+
+    # Required to free resources and be able to run multiple models back to back
+    del model
+    keras.backend.clear_session()
+    
+    # Now, same but with a masking approach and mask = None
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=False,
+        learn_covariances=False,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=1,
+        multi_gpu = False,
+        use_mask= True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T
+    )
+    
+    model = Model(config)
+    
+    mask = np.ones(10000,dtype=bool)
+    mask[400:700] = 0
+    mask[1350:1781] = 0
+    mask_dataset = model.make_dataset(mask, concatenate=True)
+    
+    combined_dataset = tf.data.Dataset.zip((dataset, mask_dataset))
+    
+    ll_mask_none = []
+    i = 0
+    
+    for data_item, mask_item in combined_dataset:
+        x = data_item["data"]
+        m = mask_item["data"]
+        ll_1 = model.get_likelihood(x,m)
+        ll_mask_none.append(ll_1)
+        i+=1
+    ll_mask_none = np.concatenate(ll_mask_none)
+    
+    # Required to free resources and be able to run multiple models back to back
+    del model
+    keras.backend.clear_session()
+    
+    assert np.allclose(ll_mask_none[:,mask],ll_base[:,mask])
+    assert not np.allclose(ll_mask_none, ll_base)
+    #assert np.allclose(ll_mask_none,ll_base), f"Expected {ll_base}, actual {ll_mask_none}"
+    
+def test_likelihood_out_mask_one():
     """The log likelihood outside of the LL mask
-    must be exactly zero.
+    must be exactly one.
     """
-    assert True == False
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    random_means = np.random.randn(3,10)
+        
+    
+    # Now, same but with a masking approach and mask = None
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=False,
+        learn_covariances=False,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=1,
+        multi_gpu = False,
+        use_mask= True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T
+    )
+    
+    model = Model(config)
+    
+    data = Data([np.random.randn(10000, 10)],time_axis_first=True, sampling_frequency=250.0)    
+    dataset = model.make_dataset(data, concatenate=True)
+    
+    
+    mask = np.ones(10000,dtype=bool)
+    mask[400:700] = 0
+    mask[1350:1781] = 0
+    mask_dataset = model.make_dataset(mask, concatenate=True)
+    
+    
+    combined_dataset = tf.data.Dataset.zip((dataset, mask_dataset))
+    
+    ll_mask_none = []
+    i = 0
+    
+    for data_item, mask_item in combined_dataset:
+        x = data_item["data"]
+        m = mask_item["data"]
+        ll_1 = model.get_likelihood(x,m)
+        ll_mask_none.append(ll_1)
+        i+=1
+    ll_mask_none = np.concatenate(ll_mask_none)
+    
+    # Required to free resources and be able to run multiple models back to back
+    del model
+    keras.backend.clear_session()
+    assert np.allclose(ll_mask_none[:,~mask],1)
+    
+def test_posterior_marginal_masked():
+    ########
+    # Setup model parameters
+    ########
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    
+        
+    random_means = np.random.randn(3,10)
+    
+    ##########
+    # Generate data
+    ##########
+    
+    data_ = np.random.randn(10000, 10)
+    data = Data([data_],time_axis_first=True, sampling_frequency=250.0)
+    mask = np.ones(10000,dtype=bool)
+    mask[400:700] = 0
+    mask[1350:1781] = 0
+    
+    
+    #########
+    # Setup first model
+    #########
+    
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask= True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    
+    dataset = model.make_dataset(data, shuffle=False, concatenate=True)
+    mask_dataset = model.make_dataset(mask, shuffle=False, concatenate=True)
+    # Set static loss scaling factor (Must be done before fusing)
+    model.set_static_loss_scaling_factor(dataset)
+    # Fuse as a single dataset
+    dataset = tf.data.Dataset.zip((dataset, mask_dataset))
+    
+    ##########
+    # Get posteriors for the model on full data with censored LL
+    ##########
+    
+    gammas_censored = []
+    xis_masked = []
+    lls_censored = []
+    for element in dataset:
+        if isinstance(element, (list, tuple)) and len(element) == 2:
+            data, ll_masks = element
+            ll_masks = ll_masks["data"]
+        else:
+            data, ll_masks = element, None
+        x = data["data"]
+        lls_censored.append(model.get_likelihood(x,ll_masks=ll_masks))
 
-def test_fit_with_mask_equivalent_to_segmenting():
-    """Segmenting out points should yield qualitatively similar results
-    as masking them.
-    """
-    assert True == False
+        gamma, xi = model.get_posterior(x,ll_masks=ll_masks)
+        gammas_censored.append(gamma)
+        xis_masked.append(xi)
+        
+    del model
+    keras.backend.clear_session()
+        
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask= False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+    )
+    
+    model = Model(config)
+    data = Data([data_[mask]],time_axis_first=True, sampling_frequency=250.0)
+    dataset = model.make_dataset(data, shuffle=False, concatenate=True)
+    # Set static loss scaling factor (Must be done before fusing)
+    model.set_static_loss_scaling_factor(dataset)
+        
+    #########
+    # Get gammas for model of cropped datapoints
+    #########
+    gammas_cropped = []
+    xis_ = []
+    lls_cropped = []
+    for element in dataset:
+        if isinstance(element, (list, tuple)) and len(element) == 2:
+            data, ll_masks = element
+            ll_masks = ll_masks["data"]
+        else:
+            data, ll_masks = element, None
+        x = data["data"]
+        # Shape of gamma is (batch_size*sequence_length, n_states)
+        # Shape of xi is (batch_size*sequence_length-1, n_states*n_states)
+        gamma, xi = model.get_posterior(x,ll_masks=ll_masks)
+        gammas_cropped.append(gamma)
+        lls_cropped.append(model.get_likelihood(x,ll_masks=None))
+        xis_.append(xi)
+    gammas_cropped = np.concatenate(gammas_cropped)
+
+    del model
+    keras.backend.clear_session()
+
+    ########
+    # Because censored and uncensored have different shapes due to batching and masking:
+    # -> Apply the mask to the censored LL approach
+    # -> Crop result to fit in batch size
+    ########
+    gammas_censored = np.concatenate(gammas_censored)
+    gammas_censored_cropped = gammas_censored[mask]
+    n_s = gammas_censored_cropped.shape[0] // 1000 * 1000
+    gammas_censored_cropped = gammas_censored_cropped[:n_s]
+    
+    lls_censored_cropped = np.concatenate(lls_censored)[:,mask]
+    lls_censored_cropped = lls_censored_cropped[:,:n_s]
+
+    #####
+    # Compare entries.
+    # Places where we expect to see differences are boundaries, which would drive effects in differences.
+    # The segments are [0,400], [700:1350], [1781:]
+    # Consequently, we should expect that [0,400] is untouched, as there is no censoring there
+    # Due to potential boundary effects of Baum Welch around edges (forward-backward pass), 
+    # we must take a small edge off to compare, hence why we consider samples [0,390] instead of [0,400]
+    #####
+    assert np.allclose(gammas_censored_cropped[:390],gammas_cropped[:390])
+    
+    # We also verify here that in this segment, the shifts in data is not explained only by state transitions
+    # but also by observations
+    assert not np.allclose(gammas_censored_cropped[1:391], gammas_censored_cropped[:390] @ random_T)
+    
+    
+    ####
+    # In the samples which are censored (t=400 to 699), the posterior is driven only by the transition matrix
+    ####
+    assert np.allclose(gammas_censored[400:600], gammas_censored[399:599] @ random_T)

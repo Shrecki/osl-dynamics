@@ -268,11 +268,21 @@ class Model(ModelBase):
             dfo_tol = 0
 
         # Make a TensorFlow Dataset
-        dataset = self.make_dataset(dataset, shuffle=True, concatenate=True)
+        #dataset= None
+        if ll_masks is not None:
+            dataset = self.make_dataset(dataset, shuffle=False, concatenate=True)
+            ll_masks = self.make_dataset(ll_masks, shuffle=False, concatenate=True)
+            
+            # Set static loss scaling factor (Must be done before fusing)
+            self.set_static_loss_scaling_factor(dataset)
+            # Fuse as a single dataset
+            dataset = tf.data.Dataset.zip((dataset, ll_masks))
+        else: 
+            dataset = self.make_dataset(dataset, shuffle=True, concatenate=True)
+            # Set static loss scaling factor
+            self.set_static_loss_scaling_factor(dataset)
 
-        # Set static loss scaling factor
-        self.set_static_loss_scaling_factor(dataset)
-
+        
         # Training curves
         history = {"loss": [], "rho": [], "lr": [], "fo": [], "max_dfo": []}
 
@@ -299,7 +309,12 @@ class Model(ModelBase):
             # Loop over batches
             loss = []
             occupancies = []
-            for data in dataset:
+            for element in dataset:
+                if isinstance(element, (list, tuple)) and len(element) == 2:
+                    data, ll_masks = element
+                    ll_masks = ll_masks["data"]
+                else:
+                    data, ll_masks = element, None
                 x = data["data"]
 
                 # Update state probabilities
@@ -1840,16 +1855,6 @@ class Model(ModelBase):
         ll_loss = None
         model = None
         if config.use_mask:
-            ll_loss_layer = CategoricalLogLikelihoodLossLayer(
-                config.n_states,
-                config.covariances_epsilon,
-                config.loss_calc,
-                name="ll_loss",
-            )
-            ll_loss = ll_loss_layer([data, mu, D, gamma, None])
-            model = tf.keras.Model(inputs=inputs, outputs=[ll_loss], name="HMM")
-
-        else:
             ll_loss_layer = CategoricalLogLikelihoodLossLayerMasked(
                 config.n_states,
                 config.covariances_epsilon,
@@ -1863,4 +1868,13 @@ class Model(ModelBase):
             )
             ll_loss = ll_loss_layer([data, mu, D, gamma, None, mask_input])
             model = tf.keras.Model(inputs=[inputs, mask_input], outputs=[ll_loss], name="HMM")
+        else:
+            ll_loss_layer = CategoricalLogLikelihoodLossLayer(
+                config.n_states,
+                config.covariances_epsilon,
+                config.loss_calc,
+                name="ll_loss",
+            )
+            ll_loss = ll_loss_layer([data, mu, D, gamma, None])
+            model = tf.keras.Model(inputs=inputs, outputs=[ll_loss], name="HMM")
         return model

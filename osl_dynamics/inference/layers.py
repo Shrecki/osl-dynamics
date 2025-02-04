@@ -1592,6 +1592,7 @@ class CategoricalLogLikelihoodLossLayerMasked(layers.Layer):
         if mask is not None:
             # Ensure that mask is of type float and broadcastable to ll_loss
             mask = tf.cast(mask, ll_loss.dtype)
+            mask = tf.squeeze(mask, axis=-1)
             ll_loss = ll_loss * mask
 
             # To normalize properly, sum only over valid time points.
