@@ -572,26 +572,25 @@ class Model(ModelBase):
     def override_xi(self,xi, forced_states):
         if forced_states is not None:
             # edit gamma
-            T_minus1, n_states, _ = xi.shape
+            T_minus1, n_states_sq = xi.shape
+            n_states = int(np.sqrt(n_states_sq))
             for t in range(T_minus1):
                 s_t = forced_states[t]
                 s_t1 = forced_states[t+1]
+                
                 if s_t >= 0 and s_t1 >= 0:
                     # Override: zero the entire matrix.
                     for i in range(n_states):
                         for j in range(n_states):
-                            xi[t, i, j] = 0.0
+                            xi[t, i*n_states+ j] = 0.0
                     # Force the transition probability to be 1 for (s_t, s_t1)
                     xi[t, s_t, s_t1] = 1.0
-                # Optionally, re-normalize the row so that the sum is exactly 1.
-                s = 0.0
-                for i in range(n_states):
-                    for j in range(n_states):
-                        s += xi[t, i, j]
-                if s > 0:
-                    for i in range(n_states):
-                        for j in range(n_states):
-                            xi[t, i, j] /= s
+            # Renormalize if needed
+            s_ = np.sum(xi, axis=1)
+            if not np.allclose(s_, 1.0):
+                print(s_)
+                xi /= np.expand_dims(s_, axis=1) + EPS
+
         return xi
         
     def get_posterior(self, x, ll_masks=None, forced_states=None):

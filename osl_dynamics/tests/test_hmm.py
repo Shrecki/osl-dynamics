@@ -15,6 +15,7 @@ from osl_dynamics.simulation import HMM_MVN
 import tensorflow as tf
 import keras
 import copy
+import sys
 
 def test_ll_mask_none_equals_no_mask():
     """The log likelihood of a data under 
@@ -541,7 +542,7 @@ def test_override_gamma_with_None_is_idop():
     # We assume EXACT equality
     assert np.all(gamma ==gamma_corr)
     
-def test_override_gamma_with_NegStateSeq():
+def test_override_gamma_with_NegStateSeq_isNoOP():
     """
     When the state sequence is negative, we expect to get back exactly original gamma
     """
@@ -611,3 +612,66 @@ def test_override_gamma_proper():
     
     assert np.all(gamma_corr[state_seq == 1][:,1] == 1)
     assert np.all(gamma_corr[state_seq == 1][:,[0,2]] == 0)
+    
+    
+    
+def test_override_xi_with_None_is_idop():
+    """
+    When the state sequence is None, we expect to get back exactly original gamma
+    """
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask= True,
+        
+    )
+    
+    model = Model(config)
+    
+    n_t = 1000*30
+    n_s = 3
+    xi = np.random.randn(n_t, n_s*n_s)
+    xi_corr = model.override_xi(copy.deepcopy(xi), None)
+    
+    # We assume EXACT equality
+    assert np.all(xi ==xi_corr)
+    
+    
+def test_override_xi_with_NegStateSeq_isNoOP():
+    """
+    When the state sequence is None, we expect to get back exactly original gamma
+    """
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask= True,
+        
+    )
+    
+    model = Model(config)
+    
+    n_t = 1000*30
+    n_s = 3
+    xi = np.abs(np.random.randn(n_t, n_s*n_s))
+    EPS = sys.float_info.epsilon
+    xi /= np.expand_dims(np.sum(xi, axis=1), axis=1) + EPS
+    states = np.ones(n_t +1)*(-1)
+    xi_corr = model.override_xi(copy.deepcopy(xi), states)
+    
+    # We assume EXACT equality
+    assert np.all(xi ==xi_corr)
+    
