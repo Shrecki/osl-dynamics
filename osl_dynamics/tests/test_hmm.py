@@ -1,3 +1,8 @@
+"""
+Authors: Fabrice Guibert
+
+"""
+
 import numpy as np
 import pytest
 from numpy.testing import (
@@ -635,6 +640,125 @@ def test_fit_with_ll_masks_on_default_raises_ValueError():
     del model
     keras.backend.clear_session()
     
+def test_fit_with_ll_state_seq_without_option_raises_ValueError():
+    """
+    Calling fit and providing state_seq on a model that does not support state sequences must throw a value error
+    """    
+    ########
+    # Setup model parameters
+    ########
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    state_seq = np.ones(1000*30)*(-1)
+
+        
+    random_means = np.random.randn(3,10)
+    
+    ##########
+    # Generate data
+    ##########
+    
+    data_ = np.random.randn(10000, 10)
+    data = Data([data_],time_axis_first=True, sampling_frequency=250.0)
+    mask = np.ones(10000,dtype=bool)
+    mask[400:700] = 0
+    mask[1350:1781] = 0
+    
+    
+    ####
+    # Case 1: default model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    
+    with pytest.raises(ValueError) as e:
+        h = model.fit(data,forced_states=state_seq)
+    assert "Cannot use forced_states in this config. Set semi_supervised=True in your config." in str(e.value)
+    del model
+    keras.backend.clear_session()
+    
+    
+    ####
+    # Case 2: masked model without mask passed
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask=True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    
+    with pytest.raises(ValueError) as e:
+        h = model.fit(data,forced_states=state_seq)
+    assert "Cannot use forced_states in this config. Set semi_supervised=True in your config." in str(e.value)
+    del model
+    keras.backend.clear_session()
+    
+    
+    ####
+    # Case 3: masked model WITH mask passed
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask=True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+
+    with pytest.raises(ValueError) as e:
+        h = model.fit(data,ll_masks=mask,forced_states=state_seq)
+    assert "Cannot use forced_states in this config. Set semi_supervised=True in your config." in str(e.value)
+    del model
+    keras.backend.clear_session()
+    
     
 def test_fit_mask_slight_differences():
     """
@@ -692,9 +816,8 @@ def test_fit_mask_slight_differences():
     )
     
     model = Model(config)
-    
     h = model.fit(data,ll_masks=mask)
-        
+    means_censored = model.get_means()
     del model
     keras.backend.clear_session()
         
@@ -717,10 +840,14 @@ def test_fit_mask_slight_differences():
     
     model = Model(config)
     
-    data = Data([data_[mask]],time_axis_first=True, sampling_frequency=250.0)
+    data = Data([data_],time_axis_first=True, sampling_frequency=250.0)
     h = model.fit(data)
+    means_full = model.get_means()
+
     del model
     keras.backend.clear_session()
+    
+    assert np.any(np.abs(means_censored - means_full) > 1e-6)
    
     
     
