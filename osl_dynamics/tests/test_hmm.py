@@ -514,6 +514,215 @@ def test_posterior_marginal_masked():
     ####
     assert np.allclose(gammas_censored[400:600], gammas_censored[399:599] @ random_T)
     
+def test_fit_with_ll_masks_on_default_raises_ValueError():
+    """
+    Calling fit on a model that does not support masks must throw a value error
+    """    
+    ########
+    # Setup model parameters
+    ########
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    
+        
+    random_means = np.random.randn(3,10)
+    
+    ##########
+    # Generate data
+    ##########
+    
+    data_ = np.random.randn(10000, 10)
+    data = Data([data_],time_axis_first=True, sampling_frequency=250.0)
+    mask = np.ones(10000,dtype=bool)
+    mask[400:700] = 0
+    mask[1350:1781] = 0
+    
+    
+    ####
+    # Case 1: default model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    
+    with pytest.raises(ValueError) as e:
+        h = model.fit(data,ll_masks=mask)
+    assert "Cannot use ll_masks in this config. Set use_mask=True in your config." in str(e.value)
+    del model
+    keras.backend.clear_session()
+    
+    
+    ####
+    # Case 2: semi supervised model without states passed
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask=False,
+        semi_supervised=True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    
+    with pytest.raises(ValueError) as e:
+        h = model.fit(data,ll_masks=mask)
+    assert "Cannot use ll_masks in this config. Set use_mask=True in your config." in str(e.value)
+    del model
+    keras.backend.clear_session()
+    
+    
+    ####
+    # Case 3: semi supervised model WITH states passed
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask=False,
+        semi_supervised=True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    state_seq = np.ones(1000*30)*(-1)
+
+    with pytest.raises(ValueError) as e:
+        h = model.fit(data,ll_masks=mask,forced_states=state_seq)
+    assert "Cannot use ll_masks in this config. Set use_mask=True in your config." in str(e.value)
+    del model
+    keras.backend.clear_session()
+    
+    
+def test_fit_mask_slight_differences():
+    """
+    Starting from the same dataset,
+    fitting with masked likelihood MUST
+    yield differences compared to fitting full
+    likelihood with respect to recovered parameters.
+    """
+    ########
+    # Setup model parameters
+    ########
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    
+        
+    random_means = np.random.randn(3,10)
+    
+    ##########
+    # Generate data
+    ##########
+    
+    data_ = np.random.randn(10000, 10)
+    data = Data([data_],time_axis_first=True, sampling_frequency=250.0)
+    mask = np.ones(10000,dtype=bool)
+    mask[400:700] = 0
+    mask[1350:1781] = 0
+    
+    
+    #########
+    # Setup first model
+    #########
+    
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask= True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    
+    h = model.fit(data,ll_masks=mask)
+        
+    del model
+    keras.backend.clear_session()
+        
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask= False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+    )
+    
+    model = Model(config)
+    
+    data = Data([data_[mask]],time_axis_first=True, sampling_frequency=250.0)
+    h = model.fit(data)
+    del model
+    keras.backend.clear_session()
+   
+    
     
     
 def test_override_gamma_with_None_is_idop():
@@ -675,3 +884,47 @@ def test_override_xi_with_NegStateSeq_isNoOP():
     # We assume EXACT equality
     assert np.all(xi ==xi_corr)
     
+def test_override_xi_is_proper():
+    """
+    When the state sequence is None, we expect to get back exactly original gamma
+    """
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask= True,
+        
+    )
+    
+    model = Model(config)
+    
+    n_t = 1000*30
+    n_s = 3
+    xi = np.abs(np.random.randn(n_t, n_s*n_s))
+    EPS = sys.float_info.epsilon
+    xi /= np.expand_dims(np.sum(xi, axis=1), axis=1) + EPS
+    states = np.ones(n_t +1, dtype=int)*(-1)
+    states[200:250] = 0
+    states[400:860] = 2
+    states[900:920] = 1
+    
+    
+    xi_corr = model.override_xi(copy.deepcopy(xi), states)
+    
+    # We assume EXACT equality in segments which do not involve modified states and boundaries
+    assert np.all(xi[:199] ==xi_corr[:199])
+    assert np.all(xi[252:397] ==xi_corr[252:397])
+    assert np.all(xi[862:898] ==xi_corr[862:898])
+    assert np.all(xi[922:] ==xi_corr[922:])
+    
+    # Within segments, the joint distribution should strictly be the self transition of state to itself
+    m = xi_corr[201:248]
+    v = np.array([[1,0,0],[0,0,0],[0,0,0]]).flatten()
+    v_b = np.broadcast_to(v, m.shape)
+    assert np.allclose(m,v_b)

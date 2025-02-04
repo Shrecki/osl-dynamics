@@ -150,6 +150,7 @@ class Config(BaseModelConfig):
     
     # Use masking or not
     use_mask: bool = False
+    semi_supervised:bool = False
 
     def __post_init__(self):
         self.validate_observation_model_parameters()
@@ -206,6 +207,7 @@ class Model(ModelBase):
         save_filepath=None,
         dfo_tol=None,
         ll_masks = None,
+        forced_states = None,
         verbose=1,
         **kwargs,
     ):
@@ -239,6 +241,12 @@ class Model(ModelBase):
             (equivalent to marginalizing them out). If :code:`None`, all points
             are included. To use this option, make sure that you set :code:`use_mask=True`
             when setting up your model Config.
+        forced_states: np.ndarray of ints, option (default is None)
+            Points where states are known. If states are passed in this way,
+            posterior probabilities are hard set to 1 in relevant time windows.
+            If :code:`None`, states are free to evolve. 
+            To use this option, make sure that you set :code:`semi_supervised=True` when 
+            setting up your model Config.
         verbose : int, optional
             Verbosity level. :code:`0=silent`.
         kwargs : keyword arguments, optional
@@ -268,20 +276,24 @@ class Model(ModelBase):
             dfo_tol = 0
 
         # Make a TensorFlow Dataset
-        #dataset= None
-        if ll_masks is not None:
-            dataset = self.make_dataset(dataset, shuffle=False, concatenate=True)
-            ll_masks = self.make_dataset(ll_masks, shuffle=False, concatenate=True)
-            
-            # Set static loss scaling factor (Must be done before fusing)
-            self.set_static_loss_scaling_factor(dataset)
-            # Fuse as a single dataset
-            dataset = tf.data.Dataset.zip((dataset, ll_masks))
-        else: 
-            dataset = self.make_dataset(dataset, shuffle=True, concatenate=True)
-            # Set static loss scaling factor
-            self.set_static_loss_scaling_factor(dataset)
+        dataset = self.make_dataset(dataset, shuffle=False, concatenate=True)
+        # Set static loss scaling factor (Sets bash size in model)
+        self.set_static_loss_scaling_factor(dataset)
 
+        data_tuple = (dataset,)
+        if ll_masks is not None:
+            if not self.config.use_mask:
+                raise ValueError("Cannot use ll_masks in this config. Set use_mask=True in your config.")
+            ll_masks = self.make_dataset(ll_masks, shuffle=False, concatenate=True)
+            data_tuple = data_tuple + (ll_masks,)
+        if forced_states is not None:
+            if not self.config.semi_supervised:
+                raise ValueError("Cannot use forced_states in this config. Set semi_supervised=True in your config.")
+            forced_states = self.make_dataset(forced_states, shuffle=False, concatenate=True)
+            data_tuple = data_tuple + (forced_states,)
+        if len(data_tuple) > 1:
+            # Fuse as a single dataset
+            dataset = tf.data.Dataset.zip(data_tuple)
         
         # Training curves
         history = {"loss": [], "rho": [], "lr": [], "fo": [], "max_dfo": []}
@@ -310,15 +322,34 @@ class Model(ModelBase):
             loss = []
             occupancies = []
             for element in dataset:
-                if isinstance(element, (list, tuple)) and len(element) == 2:
-                    data, ll_masks = element
-                    ll_masks = ll_masks["data"]
+                if isinstance(element, (list, tuple)):
+                    if len(element) == 2:
+                        if self.config.use_mask:
+                            data, ll_masks = element
+                            forced_states = None
+                            ll_masks = ll_masks["data"]  
+                        elif self.config.semi_supervised:
+                            data, forced_states = element
+                            ll_masks = None
+                            forced_states = forced_states["data"] 
+                        else:
+                            raise ValueError("Dataset element is a tuple of data, which is not supported by this model."\
+                                             "If you passed some ll_masks, set use_mask=True in the Config object."\
+                                             " If you passed some forced_states, set semi_supervised=True in the Config object.")
+                    elif len(element) == 3:
+                        if self.config.use_mask and self.config.semi_supervised:
+                            data, ll_masks, forced_states = element
+                            forced_states = forced_states["data"]
+                            ll_masks = ll_masks["data"]
+                        else:
+                            raise ValueError("Dataset element is a thruple, which is not supported by this model."\
+                                "If you passed ll_masks and forced_states, set semi_supervised=True and use_mask=True in the Config object.")
                 else:
-                    data, ll_masks = element, None
+                    data, ll_masks, forced_states = element, None, None
                 x = data["data"]
 
                 # Update state probabilities
-                gamma, xi = self.get_posterior(x,ll_masks=ll_masks)
+                gamma, xi = self.get_posterior(x,ll_masks=ll_masks,forced_states=forced_states)
 
                 # Update transition probability matrix
                 if self.config.learn_trans_prob:
@@ -571,7 +602,6 @@ class Model(ModelBase):
     @numba.jit
     def override_xi(self,xi, forced_states):
         if forced_states is not None:
-            # edit gamma
             T_minus1, n_states_sq = xi.shape
             n_states = int(np.sqrt(n_states_sq))
             for t in range(T_minus1):
@@ -580,17 +610,10 @@ class Model(ModelBase):
                 
                 if s_t >= 0 and s_t1 >= 0:
                     # Override: zero the entire matrix.
-                    for i in range(n_states):
-                        for j in range(n_states):
-                            xi[t, i*n_states+ j] = 0.0
+                    xi[t] = 0
                     # Force the transition probability to be 1 for (s_t, s_t1)
-                    xi[t, s_t, s_t1] = 1.0
-            # Renormalize if needed
-            s_ = np.sum(xi, axis=1)
-            if not np.allclose(s_, 1.0):
-                print(s_)
-                xi /= np.expand_dims(s_, axis=1) + EPS
-
+                    xi[t, s_t*n_states + s_t1] = 1.0
+            # Since transitions are are strictly 0 or 1, no renormalization required
         return xi
         
     def get_posterior(self, x, ll_masks=None, forced_states=None):
@@ -1919,7 +1942,15 @@ class Model(ModelBase):
                 name="mask",
             )
             ll_loss = ll_loss_layer([data, mu, D, gamma, None, mask_input])
-            model = tf.keras.Model(inputs=[inputs, mask_input], outputs=[ll_loss], name="HMM")
+            
+            if config.semi_supervised:
+                state_seq_input = layers.Input(
+                    shape=(config.sequence_length, 1),
+                    name="state_labels",
+                ) 
+                model = tf.keras.Model(inputs=[inputs, mask_input, state_seq_input], outputs=[ll_loss], name="HMM")
+            else:
+                model = tf.keras.Model(inputs=[inputs, mask_input], outputs=[ll_loss], name="HMM")
         else:
             ll_loss_layer = CategoricalLogLikelihoodLossLayer(
                 config.n_states,
@@ -1928,5 +1959,12 @@ class Model(ModelBase):
                 name="ll_loss",
             )
             ll_loss = ll_loss_layer([data, mu, D, gamma, None])
-            model = tf.keras.Model(inputs=inputs, outputs=[ll_loss], name="HMM")
+            if config.semi_supervised:
+                state_seq_input = layers.Input(
+                    shape=(config.sequence_length, 1),
+                    name="state_labels",
+                ) 
+                model = tf.keras.Model(inputs=[inputs, state_seq_input], outputs=[ll_loss], name="HMM")
+            else:
+                model = tf.keras.Model(inputs=inputs, outputs=[ll_loss], name="HMM")
         return model
