@@ -553,7 +553,48 @@ class Model(ModelBase):
 
         return best_history
 
-    def get_posterior(self, x, ll_masks=None):
+    @numba.jit
+    def override_gamma(gamma, forced_states):
+        if forced_states is not None:
+            # edit gamma
+            T, n_states = gamma.shape
+            # Copy gamma to avoid modifying the original array.
+            for t in range(T):
+                if forced_states[t] >= 0:
+                    # Zero out the t-th row.
+                    for s in range(n_states):
+                        gamma[t, s] = 0.0
+                    # Set the forced state's probability to 1.
+                    gamma[t, forced_states[t]] = 1.0
+        return gamma
+    
+    @numba.jit
+    def override_xi(xi, forced_states):
+        if forced_states is not None:
+            # edit gamma
+            T_minus1, n_states, _ = xi.shape
+            for t in range(T_minus1):
+                s_t = forced_states[t]
+                s_t1 = forced_states[t+1]
+                if s_t >= 0 and s_t1 >= 0:
+                    # Override: zero the entire matrix.
+                    for i in range(n_states):
+                        for j in range(n_states):
+                            xi[t, i, j] = 0.0
+                    # Force the transition probability to be 1 for (s_t, s_t1)
+                    xi[t, s_t, s_t1] = 1.0
+                # Optionally, re-normalize the row so that the sum is exactly 1.
+                s = 0.0
+                for i in range(n_states):
+                    for j in range(n_states):
+                        s += xi[t, i, j]
+                if s > 0:
+                    for i in range(n_states):
+                        for j in range(n_states):
+                            xi[t, i, j] /= s
+        return xi
+        
+    def get_posterior(self, x, ll_masks=None, forced_states=None):
         """Get marginal and joint posterior.
 
         Parameters
@@ -564,6 +605,12 @@ class Model(ModelBase):
             Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
             Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
             If None, all points are considered
+        forced_states: np.ndarray of ints, optional
+            Array of known state timecourses. Shape is (batch_size, sequence_length).
+            Every entry is either -1 (no known state for this point) or the state number
+            (between 0 and n_states). 
+            The posteriors will be corrected to be hard assigned for the provided points
+            to the provided states after Baum Welch computation.
 
         Returns
         -------
@@ -578,7 +625,13 @@ class Model(ModelBase):
         B = self.get_likelihood(x, ll_masks=ll_masks)
         Pi_0 = self.state_probs_t0
         P = self.trans_prob
-        return self.baum_welch(B, Pi_0, P)
+        gamma, xi = self.baum_welch(B, Pi_0, P)
+        
+        # Adjust gamma and xi according to forced state sequence
+        # (Not work done if forced_states is None)
+        gamma = self.override_gamma(gamma, forced_states)
+        xi = self.override_xi(xi, forced_states)
+        return gamma,xi
 
     @numba.jit
     def baum_welch(self, B, Pi_0, P):
