@@ -848,7 +848,6 @@ def test_fit_mask_slight_differences():
     keras.backend.clear_session()
     
     assert np.any(np.abs(means_censored - means_full) > 1e-6)
-   
     
     
     
@@ -1055,3 +1054,152 @@ def test_override_xi_is_proper():
     v = np.array([[1,0,0],[0,0,0],[0,0,0]]).flatten()
     v_b = np.broadcast_to(v, m.shape)
     assert np.allclose(m,v_b)
+
+
+
+def test_get_alpha_with_options_but_None_gives_base_val():
+    """
+    Calling get_alpha on default model and use_mask model with None mask or semi_supervised model with None state seq
+    must yield exactly the same results.
+    """    
+    ########
+    # Setup model parameters
+    ########
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    state_seq = np.ones(1000*30)*(-1)
+
+        
+    random_means = np.random.randn(3,10)
+    
+    ##########
+    # Generate data
+    ##########
+    
+    data_ = np.random.randn(10000, 10)
+    data = Data([data_],time_axis_first=True, sampling_frequency=250.0)
+    mask = np.ones(10000,dtype=bool)
+    mask[400:700] = 0
+    mask[1350:1781] = 0
+    
+    
+    ####
+    # Case 1: default model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data)
+    alpha_base = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    
+    ####
+    # Case 2: masked model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask=True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data)
+    alpha_mask = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    
+    ####
+    # Case 3: state seq model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        semi_supervised=True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data)
+    alpha_state_seq = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    ##################
+    # Case 4: both
+    ##################
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        semi_supervised=True,
+        use_mask = True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data)
+    alpha_state_seq_mask = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    #assert np.allclose(alpha_base, alpha_state_seq)
+    #assert np.allclose(alpha_base, alpha_state_seq_mask)
+    #assert np.allclose(alpha_base, alpha_mask)
+    assert True == False

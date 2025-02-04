@@ -280,17 +280,34 @@ class Model(ModelBase):
         # Set static loss scaling factor (Sets bash size in model)
         self.set_static_loss_scaling_factor(dataset)
 
+        n_points = 0
+        for batch in dataset.as_numpy_iterator():
+            # Assume each batch is a dictionary with key "data"
+            b, seq, _ = batch["data"].shape
+            n_points += b * seq
+        
+        #print(f"N_points: {n_points}")
         data_tuple = (dataset,)
-        if ll_masks is not None:
-            if not self.config.use_mask:
+        if not self.config.use_mask:
+            if ll_masks is not None:
                 raise ValueError("Cannot use ll_masks in this config. Set use_mask=True in your config.")
+            
+        if self.config.use_mask:
+            if ll_masks is None:
+                ll_masks = np.ones(n_points, dtype=bool)
             ll_masks = self.make_dataset(ll_masks, shuffle=False, concatenate=True)
             data_tuple = data_tuple + (ll_masks,)
-        if forced_states is not None:
-            if not self.config.semi_supervised:
+            
+        if not self.config.semi_supervised:
+            if forced_states is not None:
                 raise ValueError("Cannot use forced_states in this config. Set semi_supervised=True in your config.")
+          
+        if self.config.semi_supervised:
+            if forced_states is None:
+                forced_states = np.ones(n_points,dtype=int)*(-1)
             forced_states = self.make_dataset(forced_states, shuffle=False, concatenate=True)
             data_tuple = data_tuple + (forced_states,)
+        
         if len(data_tuple) > 1:
             # Fuse as a single dataset
             dataset = tf.data.Dataset.zip(data_tuple)
@@ -366,10 +383,16 @@ class Model(ModelBase):
                 # Update observation model
                 x_and_gamma = np.concatenate([x, gamma], axis=2)
                 h = None
-                if ll_masks is None: 
+                if not self.config.use_mask and not self.config.semi_supervised: 
                     h = self.model.fit(x_and_gamma, epochs=1, verbose=0, **kwargs)
                 else:
-                    h = self.model.fit([x_and_gamma, ll_masks], epochs=1, verbose=0, **kwargs)
+                    if self.config.use_mask:
+                        if self.config.semi_supervised:
+                            h = self.model.fit([x_and_gamma, ll_masks, forced_states], epochs=1, verbose=0, **kwargs)
+                        else:
+                            h = self.model.fit([x_and_gamma, ll_masks], epochs=1, verbose=0, **kwargs)
+                    else:
+                        h = self.model.fit([x_and_gamma, forced_states], epochs=1, verbose=0, **kwargs)
 
                 # Get new loss
                 l = h.history["loss"][0]
@@ -587,21 +610,44 @@ class Model(ModelBase):
     @numba.jit
     def override_gamma(self,gamma, forced_states):
         if forced_states is not None:
-            # edit gamma
-            T, n_states = gamma.shape
-            # Copy gamma to avoid modifying the original array.
-            for t in range(T):
-                if forced_states[t] >= 0:
-                    # Zero out the t-th row.
-                    for s in range(n_states):
-                        gamma[t, s] = 0.0
-                    # Set the forced state's probability to 1.
-                    gamma[t, forced_states[t]] = 1.0
+            if hasattr(forced_states, "numpy"):
+                forced_flat = forced_states.numpy().reshape(-1).astype(int)
+            else:
+                forced_flat = forced_states.reshape(-1).astype(int)
+
+            # Use fancy indexing to set to 1 the desired states and exclude others in the posterior
+            fixed_state_idx = np.where(forced_flat >= 0)[0]
+            gamma[fixed_state_idx] = 0
+            gamma[fixed_state_idx, forced_flat[fixed_state_idx]] = 1
         return gamma
     
     @numba.jit
     def override_xi(self,xi, forced_states):
         if forced_states is not None:
+            T_minus1, n_states_sq = xi.shape
+            n_states = int(np.sqrt(n_states_sq))
+            if hasattr(forced_states, "numpy"):
+                forced_flat = forced_states.numpy().reshape(-1)
+            else:
+                forced_flat = forced_states.reshape(-1)
+            
+            
+            # Create a boolean mask for transitions where both t and t+1 are forced.
+            valid = (forced_flat[:-1] >= 0) & (forced_flat[1:] >= 0)  # shape (T-1,)
+            
+            # Get indices of transitions that are forced.
+            forced_idx = np.where(valid)[0]  # These are indices in the range [0, T-1)
+            
+            # For these forced transitions, zero out the entire row.
+            xi[forced_idx, :] = 0.0
+            
+            # Compute the positions for the forced transitions.
+            # For each valid index t, we want to set xi_new[t, forced_flat[t]*n_states + forced_flat[t+1]] = 1.
+            positions = forced_flat[forced_idx] * n_states + forced_flat[forced_idx + 1]
+            
+            # Use fancy indexing to assign 1.0 to these positions.
+            xi[forced_idx, positions.astype(int)] = 1.0
+            """
             T_minus1, n_states_sq = xi.shape
             n_states = int(np.sqrt(n_states_sq))
             for t in range(T_minus1):
@@ -614,6 +660,7 @@ class Model(ModelBase):
                     # Force the transition probability to be 1 for (s_t, s_t1)
                     xi[t, s_t*n_states + s_t1] = 1.0
             # Since transitions are are strictly 0 or 1, no renormalization required
+            """
         return xi
         
     def get_posterior(self, x, ll_masks=None, forced_states=None):
@@ -731,6 +778,7 @@ class Model(ModelBase):
         likelihood : np.ndarray
             Likelihood. Shape is (n_states, batch_size*sequence_length).
         """
+        _logger.debug("Getting likelihood")
         # Get the current observation model parameters
         means, covs = self.get_means_covariances()
         n_states = means.shape[0]
@@ -751,6 +799,7 @@ class Model(ModelBase):
             )
             log_likelihood[state] = mvn.log_prob(x)
             if ll_masks is not None:
+                _logger.debug(f"Mask shape {ll_masks.shape}, data shape {log_likelihood[state].shape} use_mask {self.config.use_mask}")
                 log_likelihood[state] = log_likelihood[state] * ll_masks[:,:,0]
         log_likelihood = log_likelihood.reshape(n_states, batch_size * sequence_length)
         
@@ -1391,7 +1440,7 @@ class Model(ModelBase):
 
         return evidence
 
-    def get_alpha(self, dataset, concatenate=False, remove_edge_effects=False, ll_masks=None):
+    def get_alpha(self, dataset, concatenate=False, remove_edge_effects=False, ll_masks=None, forced_states=None):
         """Get state probabilities.
 
         Parameters
@@ -1439,7 +1488,7 @@ class Model(ModelBase):
             for j, data in enumerate(dataset[i]):
                 n_batches = dtf.get_n_batches(dataset[i])
                 x = data["data"]
-                g, _ = self.get_posterior(x,ll_masks=ll_masks)
+                g, _ = self.get_posterior(x,ll_masks=ll_masks, forced_states=forced_states)
                 if remove_edge_effects:
                     batch_size, sequence_length, _ = x.shape
                     n_states = g.shape[-1]
