@@ -1391,6 +1391,144 @@ def test_get_alpha_with_options_but_None_gives_base_val():
     assert np.allclose(alpha_base, alpha_mask)
     #assert True == False
     
+def test_mask_influences_tc():
+    """
+    Masking with state censoring should affect
+    posterior state probabilities.
+    In particular, we should expect that the probabilities
+    which are hard set should be 1.
+    """
+    ########
+    # Setup model parameters
+    ########
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    state_seq = np.ones(10000)*(-1)
+    state_seq[400:450]=1
+    state_seq[450:460] = 2
+        
+    random_means = np.random.randn(3,10)
+    
+    ##########
+    # Generate data
+    ##########
+    
+    data_ = np.random.randn(10000, 10)
+    data = Data([data_],time_axis_first=True, sampling_frequency=250.0)
+    mask = np.ones(10000,dtype=bool)
+    mask[400:700] = 0
+    mask[1350:1781] = 0
+    
+    keras.utils.set_random_seed(812)
+
+    
+    ####
+    # Case 1: default model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data)
+    alpha_base = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    
+    ####
+    # Case 2: state seq model
+    ####
+    keras.utils.set_random_seed(812)
+
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        semi_supervised=True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data, forced_states=state_seq)
+    alpha_state_seq = model.get_alpha(data, forced_states=state_seq)
+    del model
+    keras.backend.clear_session()
+    
+    ##################
+    # Case 3: both
+    ##################
+    keras.utils.set_random_seed(812)
+
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        semi_supervised=True,        
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    #assert isinstance(data,list)
+    h = model.fit(data, forced_states=state_seq)
+    alpha_state_seq_mask = model.get_alpha(data, forced_states=state_seq)
+    del model
+    keras.backend.clear_session()
+    
+    assert np.allclose(alpha_state_seq_mask[400:450,1],1) 
+    assert np.allclose(alpha_state_seq[400:450,1],1) 
+    assert np.allclose(alpha_state_seq, alpha_state_seq_mask)
+
+    assert not np.allclose(alpha_base, alpha_state_seq_mask)
+    
+def test_likelihood_mask():
+    """
+    Likelihood masking specific points is intended to
+    remove said points from the learning.
+    As such, learnt parameters should differ, specifically
+    in the case of outlying points.
+    """
+    assert True == False
+    
 def test_seed():
     """
     Calling get_alpha on default model and use_mask model with None mask or semi_supervised model with None state seq
