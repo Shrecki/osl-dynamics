@@ -1245,8 +1245,9 @@ def test_get_alpha_with_options_but_None_gives_base_val():
     for i in range(3):
         random_T[i] /= random_T[i].sum()
         
-    state_seq = np.ones(1000*30)*(-1)
-
+    state_seq = np.ones(10000)*(-1)
+    state_seq[400:450]=1
+    state_seq[450:460] = 2
         
     random_means = np.random.randn(3,10)
     
@@ -1260,6 +1261,8 @@ def test_get_alpha_with_options_but_None_gives_base_val():
     mask[400:700] = 0
     mask[1350:1781] = 0
     
+    keras.utils.set_random_seed(812)
+
     
     ####
     # Case 1: default model
@@ -1291,6 +1294,8 @@ def test_get_alpha_with_options_but_None_gives_base_val():
     ####
     # Case 2: masked model
     ####
+    keras.utils.set_random_seed(812)
+
     config = Config(
         n_states=3,
         n_channels=10,
@@ -1319,6 +1324,8 @@ def test_get_alpha_with_options_but_None_gives_base_val():
     ####
     # Case 3: state seq model
     ####
+    keras.utils.set_random_seed(812)
+
     config = Config(
         n_states=3,
         n_channels=10,
@@ -1346,6 +1353,8 @@ def test_get_alpha_with_options_but_None_gives_base_val():
     ##################
     # Case 4: both
     ##################
+    keras.utils.set_random_seed(812)
+
     config = Config(
         n_states=3,
         n_channels=10,
@@ -1356,8 +1365,78 @@ def test_get_alpha_with_options_but_None_gives_base_val():
         learning_rate=0.01,
         n_epochs=5,
         multi_gpu = False,
-        semi_supervised=True,
-        use_mask = True,
+        semi_supervised=True,        
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    #assert isinstance(data,list)
+    h = model.fit(data)
+    alpha_state_seq_mask = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    #state_seq[400:450]=1
+    #state_seq[450:460] = 2
+    
+    #assert alpha_state_seq_mask.shape == alpha_base.shape
+    #assert np.allclose(alpha_state_seq_mask[400:450,1],1) 
+    #assert alpha_state_seq_
+    assert np.allclose(alpha_base, alpha_state_seq)
+    assert np.allclose(alpha_base, alpha_state_seq_mask)
+    assert np.allclose(alpha_base, alpha_mask)
+    #assert True == False
+    
+def test_seed():
+    """
+    Calling get_alpha on default model and use_mask model with None mask or semi_supervised model with None state seq
+    must yield exactly the same results.
+    """    
+    ########
+    # Setup model parameters
+    ########
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    state_seq = np.ones(10000)*(-1)
+    state_seq[400:450]=1
+    state_seq[450:460] = 2
+        
+    random_means = np.random.randn(3,10)
+    
+    ##########
+    # Generate data
+    ##########
+    
+    data_ = np.random.randn(10000, 10)
+    data = Data([data_],time_axis_first=True, sampling_frequency=250.0)
+    mask = np.ones(10000,dtype=bool)
+    mask[400:700] = 0
+    mask[1350:1781] = 0
+    
+    keras.utils.set_random_seed(812)
+    ####
+    # Case 1: default model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
         initial_means=random_means,
         initial_covariances=random_covs,
         initial_trans_prob=random_T,
@@ -1367,11 +1446,36 @@ def test_get_alpha_with_options_but_None_gives_base_val():
     
     model = Model(config)
     h = model.fit(data)
-    alpha_state_seq_mask = model.get_alpha(data)
+    alpha_base = model.get_alpha(data)
     del model
     keras.backend.clear_session()
     
-    #assert np.allclose(alpha_base, alpha_state_seq)
-    #assert np.allclose(alpha_base, alpha_state_seq_mask)
-    #assert np.allclose(alpha_base, alpha_mask)
-    assert True == False
+    keras.utils.set_random_seed(812)
+     ####
+    # Case 1: default model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data)
+    alpha_two = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    
+    assert np.allclose(alpha_base, alpha_two)
