@@ -47,6 +47,7 @@ from osl_dynamics.models.mod_base import BaseModelConfig, ModelBase
 from osl_dynamics.simulation import HMM
 from osl_dynamics.utils.misc import set_logging_level
 from osl_dynamics import array_ops
+from osl_dynamics.data import Data
 
 _logger = logging.getLogger("osl-dynamics")
 
@@ -236,7 +237,6 @@ class Model(ModelBase):
             b, seq, _ = batch["data"].shape
             n_points += b * seq
         
-        #print(f"N_points: {n_points}")
         data_tuple = (dataset_elem,)
             
         if self.config.use_mask:
@@ -263,6 +263,10 @@ class Model(ModelBase):
             assert not isinstance(ll_masks_list[i],list)
             data.append(self._make_combined_op(dataset_list[i], ll_masks_list[i], forced_states_list[i], step_size,concatenate))
         return data
+    
+    def cast_to_type(x, dtype):
+        x['data'] = tf.cast(x["data"], dtype)
+        return x
     
     def _make_combined_dataset(self,dataset, ll_masks, forced_states, sampling_frequency, step_size=None, concatenate=True):
         """Utility function used to zip together data with likelihood masks and supervised state sequences.
@@ -318,17 +322,15 @@ class Model(ModelBase):
             dataset_elem = tf.data.Dataset.zip(data_tuple)
         return dataset_elem
         """
-        from osl_dynamics.data import Data
         self._check_valid(ll_masks,forced_states)
         
         n_points_list = self._get_npoints(dataset)
         if self.config.use_mask:
             # Create trivial mask
             if ll_masks is None:
-                print("Initializing trivial mask")
                 ll_masks = Data([np.ones(n_points, dtype=bool) for n_points in n_points_list], time_axis_first=True, sampling_frequency=sampling_frequency)
+                #ll_masks.arrays = [x.astype(np.uint8) for x in ll_masks.arrays]
             ll_masks = self.make_dataset(ll_masks, shuffle=False, concatenate=concatenate, step_size=step_size)
-            print(ll_masks)
         else:
             if isinstance(dataset,list):
                 ll_masks = [None]*len(dataset)
@@ -336,9 +338,9 @@ class Model(ModelBase):
         if self.config.semi_supervised:
             # Create trivial forced state
             if forced_states is None:
-                print("Initializing trivial state constraint")
                 forced_states = [np.ones(n_points,dtype=int)*(-1) for n_points in n_points_list]
                 forced_states = Data(forced_states, time_axis_first=True, sampling_frequency=sampling_frequency)
+                #forced_states.arrays = [x.astype(np.int32) for x in forced_states.arrays]
             forced_states = self.make_dataset(forced_states, shuffle=False, concatenate=concatenate, step_size=step_size)
         else:
             if isinstance(dataset,list):
@@ -368,9 +370,9 @@ class Model(ModelBase):
         
         Returns
         -------
-        data:
-        ll_masks:
-        forced_states:
+        data: data in the batch
+        ll_mask: likelihood mask if self.config.use_mask is true, else None
+        forced_states: forced_states if self.config.semi_supervised is true, else None
         """
         if isinstance(element, (list, tuple)):
             if len(element) == 2:
@@ -396,6 +398,7 @@ class Model(ModelBase):
                         "If you passed ll_masks and forced_states, set semi_supervised=True and use_mask=True in the Config object.")
         else:
             data, ll_masks, forced_states = element, None, None
+        
         x = data["data"]
         return x, ll_masks, forced_states
         
@@ -478,7 +481,10 @@ class Model(ModelBase):
             dfo_tol = 0
 
         # Make a TensorFlow Dataset
-        sfreq = dataset.sampling_frequency
+        if isinstance(dataset, Data):
+            sfreq = dataset.sampling_frequency
+        else:
+            sfreq = 1.0
         dataset = self.make_dataset(dataset, shuffle=False, concatenate=True)
         
         # Set static loss scaling factor (Sets bash size in model)
