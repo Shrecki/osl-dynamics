@@ -47,6 +47,7 @@ from osl_dynamics.models.mod_base import BaseModelConfig, ModelBase
 from osl_dynamics.simulation import HMM
 from osl_dynamics.utils.misc import set_logging_level
 from osl_dynamics import array_ops
+from osl_dynamics.data import Data
 
 _logger = logging.getLogger("osl-dynamics")
 
@@ -198,6 +199,209 @@ class Model(ModelBase):
         self.set_trans_prob(self.config.initial_trans_prob)
         self.set_state_probs_t0(self.config.state_probs_t0)
 
+    def _check_valid(self, ll_masks, forced_states):
+        if not self.config.use_mask:
+            if ll_masks is not None:
+                raise ValueError("Cannot use ll_masks in this config. Set use_mask=True in your config.")
+        if not self.config.semi_supervised:
+            if forced_states is not None:
+                raise ValueError("Cannot use forced_states in this config. Set semi_supervised=True in your config.")
+        
+    def _get_npoints(self,dataset):
+        points = []
+        if isinstance(dataset, list):
+            for dataset_elem in dataset:
+                n_points = 0
+
+                for batch in dataset_elem.as_numpy_iterator():
+                    # Assume each batch is a dictionary with key "data"
+                    b, seq, _ = batch["data"].shape
+                    n_points += b * seq
+                points.append(n_points)
+        else:
+            n_points = 0
+            for batch in dataset.as_numpy_iterator():
+                # Assume each batch is a dictionary with key "data"
+                b, seq, _ = batch["data"].shape
+                n_points += b * seq
+            points.append(n_points)
+        return points
+            
+            
+    def _make_combined_op(self,dataset_elem, ll_masks_elem, forced_states_elem, step_size, concatenate):
+        self._check_valid(ll_masks_elem,forced_states_elem)
+        assert not isinstance(dataset_elem,list)
+        n_points = 0
+        for batch in dataset_elem.as_numpy_iterator():
+            # Assume each batch is a dictionary with key "data"
+            b, seq, _ = batch["data"].shape
+            n_points += b * seq
+        
+        data_tuple = (dataset_elem,)
+            
+        if self.config.use_mask:
+            #if ll_masks_elem is None:
+            #    ll_masks_elem = np.ones(n_points, dtype=bool)
+            #ll_masks_elem = self.make_dataset(ll_masks_elem, shuffle=False, concatenate=concatenate, step_size=step_size)
+            data_tuple = data_tuple + (ll_masks_elem,)
+            
+        if self.config.semi_supervised:
+            #if forced_states_elem is None:
+            #    forced_states_elem = np.ones(n_points,dtype=int)*(-1)
+            #forced_states_elem = self.make_dataset(forced_states_elem, shuffle=False, concatenate=concatenate, step_size=step_size)
+            data_tuple = data_tuple + (forced_states_elem,)
+        
+        if len(data_tuple) > 1:
+            # Fuse as a single dataset
+            dataset_elem = tf.data.Dataset.zip(data_tuple)
+        return dataset_elem
+        
+    def _make_combined_list(self, dataset_list, ll_masks_list, forced_states_list, step_size, concatenate):
+        data = []
+        for i, e in enumerate(dataset_list):
+            assert not isinstance(e,list)
+            assert not isinstance(ll_masks_list[i],list)
+            data.append(self._make_combined_op(dataset_list[i], ll_masks_list[i], forced_states_list[i], step_size,concatenate))
+        return data
+    
+    def cast_to_type(x, dtype):
+        x['data'] = tf.cast(x["data"], dtype)
+        return x
+    
+    def _make_combined_dataset(self,dataset, ll_masks, forced_states, sampling_frequency, step_size=None, concatenate=True):
+        """Utility function used to zip together data with likelihood masks and supervised state sequences.
+           Masks are only created and zipped through if their respective flag is enabled in the Config.
+        
+        Parameters
+        ----------
+        dataset : tf.data.Dataset or osl_dynamics.data.Data
+                  Training dataset.
+        ll_masks: np.ndarray or None
+                  Likelihood mask. Any timepoint not in the mask will be treated as missing data and marginalized over
+                  in likelihood (likelihood set to 1).
+                  Used only if :code:`self.config.use_mask=True`. If None, a trivial mask will be created, including all
+                  timepoints.
+        forced_states: np.ndarray or None
+                  Supervised state assignment. If forced_states[t] > 0, the posterior state at time t will be constrained to be force_states[t].
+                  Otherwise, the state posterior is obtained by Baum Welch normally.
+                  Used only if :code:`self.config.use_mask=True`. If None, a trivial state sequence of -1 will be created.
+        
+        Returns
+        -------
+        
+        dataset: tf.data.Dataset
+                 Training dataset, potentially zipped with none of the masks, one of them or both of them depending on the flags
+                 in Config.
+        """
+        
+        """
+        self._check_valid(ll_masks_elem,forced_states_elem)
+        n_points = 0
+        for batch in dataset_elem.as_numpy_iterator():
+            # Assume each batch is a dictionary with key "data"
+            b, seq, _ = batch["data"].shape
+            n_points += b * seq
+        
+        #print(f"N_points: {n_points}")
+        data_tuple = (dataset_elem,)
+            
+        if self.config.use_mask:
+            if ll_masks_elem is None:
+                ll_masks_elem = np.ones(n_points, dtype=bool)
+            ll_masks_elem = self.make_dataset(ll_masks_elem, shuffle=False, concatenate=concatenate, step_size=step_size)
+            data_tuple = data_tuple + (ll_masks_elem,)
+            
+        if self.config.semi_supervised:
+            if forced_states_elem is None:
+                forced_states_elem = np.ones(n_points,dtype=int)*(-1)
+            forced_states_elem = self.make_dataset(forced_states_elem, shuffle=False, concatenate=concatenate, step_size=step_size)
+            data_tuple = data_tuple + (forced_states_elem,)
+        
+        if len(data_tuple) > 1:
+            # Fuse as a single dataset
+            dataset_elem = tf.data.Dataset.zip(data_tuple)
+        return dataset_elem
+        """
+        self._check_valid(ll_masks,forced_states)
+        
+        n_points_list = self._get_npoints(dataset)
+        if self.config.use_mask:
+            # Create trivial mask
+            if ll_masks is None:
+                ll_masks = Data([np.ones(n_points, dtype=bool) for n_points in n_points_list], time_axis_first=True, sampling_frequency=sampling_frequency)
+                #ll_masks.arrays = [x.astype(np.uint8) for x in ll_masks.arrays]
+            ll_masks = self.make_dataset(ll_masks, shuffle=False, concatenate=concatenate, step_size=step_size)
+        else:
+            if isinstance(dataset,list):
+                ll_masks = [None]*len(dataset)
+            
+        if self.config.semi_supervised:
+            # Create trivial forced state
+            if forced_states is None:
+                forced_states = [np.ones(n_points,dtype=int)*(-1) for n_points in n_points_list]
+                forced_states = Data(forced_states, time_axis_first=True, sampling_frequency=sampling_frequency)
+                #forced_states.arrays = [x.astype(np.int32) for x in forced_states.arrays]
+            forced_states = self.make_dataset(forced_states, shuffle=False, concatenate=concatenate, step_size=step_size)
+        else:
+            if isinstance(dataset,list):
+                forced_states = [None]*len(dataset)
+            
+        if isinstance(dataset, list):
+            # Create here the masks, per sublist element
+            # @ TODO: the list approach is good BUT:
+            # we should really not do it this way, turns out
+            # we should construct our datasets direcly here
+            # and THEN, if list, we concatenate tuples by each element
+            # As a consequence, we need to consider the case of the list and the "no list"
+            # as one: turn the "no-list" as a one-element list to maintain the code simple.
+            
+            # Method handles looping
+            return self._make_combined_list(dataset, ll_masks, forced_states, step_size, concatenate)
+        else:
+            return self._make_combined_list([dataset], [ll_masks], [forced_states], step_size, concatenate)[0]
+    
+    def _unpack_inputs(self, element):
+        """
+        Unpacks element from dataset depending on flags
+        
+        Parameters
+        ----------
+        element: element of td.Dataset
+        
+        Returns
+        -------
+        data: data in the batch
+        ll_mask: likelihood mask if self.config.use_mask is true, else None
+        forced_states: forced_states if self.config.semi_supervised is true, else None
+        """
+        if isinstance(element, (list, tuple)):
+            if len(element) == 2:
+                if self.config.use_mask:
+                    data, ll_masks = element
+                    forced_states = None
+                    ll_masks = ll_masks["data"]  
+                elif self.config.semi_supervised:
+                    data, forced_states = element
+                    ll_masks = None
+                    forced_states = forced_states["data"] 
+                else:
+                    raise ValueError("Dataset element is a tuple of data, which is not supported by this model."\
+                                        "If you passed some ll_masks, set use_mask=True in the Config object."\
+                                        " If you passed some forced_states, set semi_supervised=True in the Config object.")
+            elif len(element) == 3:
+                if self.config.use_mask and self.config.semi_supervised:
+                    data, ll_masks, forced_states = element
+                    forced_states = forced_states["data"]
+                    ll_masks = ll_masks["data"]
+                else:
+                    raise ValueError("Dataset element is a thruple, which is not supported by this model."\
+                        "If you passed ll_masks and forced_states, set semi_supervised=True and use_mask=True in the Config object.")
+        else:
+            data, ll_masks, forced_states = element, None, None
+        
+        x = data["data"]
+        return x, ll_masks, forced_states
+        
     def fit(
         self,
         dataset,
@@ -259,6 +463,7 @@ class Model(ModelBase):
             Dictionary with history of the loss, learning rates (:code:`lr`
             and :code:`rho`) and fractional occupancies during training.
         """
+        self._check_valid(ll_masks,forced_states)
         if epochs is None:
             epochs = self.config.n_epochs
 
@@ -276,24 +481,16 @@ class Model(ModelBase):
             dfo_tol = 0
 
         # Make a TensorFlow Dataset
+        if isinstance(dataset, Data):
+            sfreq = dataset.sampling_frequency
+        else:
+            sfreq = 1.0
         dataset = self.make_dataset(dataset, shuffle=False, concatenate=True)
+        
         # Set static loss scaling factor (Sets bash size in model)
         self.set_static_loss_scaling_factor(dataset)
-
-        data_tuple = (dataset,)
-        if ll_masks is not None:
-            if not self.config.use_mask:
-                raise ValueError("Cannot use ll_masks in this config. Set use_mask=True in your config.")
-            ll_masks = self.make_dataset(ll_masks, shuffle=False, concatenate=True)
-            data_tuple = data_tuple + (ll_masks,)
-        if forced_states is not None:
-            if not self.config.semi_supervised:
-                raise ValueError("Cannot use forced_states in this config. Set semi_supervised=True in your config.")
-            forced_states = self.make_dataset(forced_states, shuffle=False, concatenate=True)
-            data_tuple = data_tuple + (forced_states,)
-        if len(data_tuple) > 1:
-            # Fuse as a single dataset
-            dataset = tf.data.Dataset.zip(data_tuple)
+        
+        dataset = self._make_combined_dataset(dataset, ll_masks, forced_states,sfreq,step_size=None, concatenate=True)
         
         # Training curves
         history = {"loss": [], "rho": [], "lr": [], "fo": [], "max_dfo": []}
@@ -322,32 +519,7 @@ class Model(ModelBase):
             loss = []
             occupancies = []
             for element in dataset:
-                if isinstance(element, (list, tuple)):
-                    if len(element) == 2:
-                        if self.config.use_mask:
-                            data, ll_masks = element
-                            forced_states = None
-                            ll_masks = ll_masks["data"]  
-                        elif self.config.semi_supervised:
-                            data, forced_states = element
-                            ll_masks = None
-                            forced_states = forced_states["data"] 
-                        else:
-                            raise ValueError("Dataset element is a tuple of data, which is not supported by this model."\
-                                             "If you passed some ll_masks, set use_mask=True in the Config object."\
-                                             " If you passed some forced_states, set semi_supervised=True in the Config object.")
-                    elif len(element) == 3:
-                        if self.config.use_mask and self.config.semi_supervised:
-                            data, ll_masks, forced_states = element
-                            forced_states = forced_states["data"]
-                            ll_masks = ll_masks["data"]
-                        else:
-                            raise ValueError("Dataset element is a thruple, which is not supported by this model."\
-                                "If you passed ll_masks and forced_states, set semi_supervised=True and use_mask=True in the Config object.")
-                else:
-                    data, ll_masks, forced_states = element, None, None
-                x = data["data"]
-
+                x, ll_masks, forced_states = self._unpack_inputs(element)
                 # Update state probabilities
                 gamma, xi = self.get_posterior(x,ll_masks=ll_masks,forced_states=forced_states)
 
@@ -366,10 +538,16 @@ class Model(ModelBase):
                 # Update observation model
                 x_and_gamma = np.concatenate([x, gamma], axis=2)
                 h = None
-                if ll_masks is None: 
+                if not self.config.use_mask and not self.config.semi_supervised: 
                     h = self.model.fit(x_and_gamma, epochs=1, verbose=0, **kwargs)
                 else:
-                    h = self.model.fit([x_and_gamma, ll_masks], epochs=1, verbose=0, **kwargs)
+                    if self.config.use_mask:
+                        if self.config.semi_supervised:
+                            h = self.model.fit([x_and_gamma, ll_masks, forced_states], epochs=1, verbose=0, **kwargs)
+                        else:
+                            h = self.model.fit([x_and_gamma, ll_masks], epochs=1, verbose=0, **kwargs)
+                    else:
+                        h = self.model.fit([x_and_gamma, forced_states], epochs=1, verbose=0, **kwargs)
 
                 # Get new loss
                 l = h.history["loss"][0]
@@ -587,33 +765,43 @@ class Model(ModelBase):
     @numba.jit
     def override_gamma(self,gamma, forced_states):
         if forced_states is not None:
-            # edit gamma
-            T, n_states = gamma.shape
-            # Copy gamma to avoid modifying the original array.
-            for t in range(T):
-                if forced_states[t] >= 0:
-                    # Zero out the t-th row.
-                    for s in range(n_states):
-                        gamma[t, s] = 0.0
-                    # Set the forced state's probability to 1.
-                    gamma[t, forced_states[t]] = 1.0
+            if hasattr(forced_states, "numpy"):
+                forced_flat = forced_states.numpy().reshape(-1).astype(int)
+            else:
+                forced_flat = forced_states.reshape(-1).astype(int)
+
+            # Use fancy indexing to set to 1 the desired states and exclude others in the posterior
+            fixed_state_idx = np.where(forced_flat >= 0)[0]
+            gamma[fixed_state_idx] = 0
+            gamma[fixed_state_idx, forced_flat[fixed_state_idx]] = 1
         return gamma
     
     @numba.jit
     def override_xi(self,xi, forced_states):
         if forced_states is not None:
-            T_minus1, n_states_sq = xi.shape
+            n_states_sq = xi.shape[1]
             n_states = int(np.sqrt(n_states_sq))
-            for t in range(T_minus1):
-                s_t = forced_states[t]
-                s_t1 = forced_states[t+1]
-                
-                if s_t >= 0 and s_t1 >= 0:
-                    # Override: zero the entire matrix.
-                    xi[t] = 0
-                    # Force the transition probability to be 1 for (s_t, s_t1)
-                    xi[t, s_t*n_states + s_t1] = 1.0
-            # Since transitions are are strictly 0 or 1, no renormalization required
+            if hasattr(forced_states, "numpy"):
+                forced_flat = forced_states.numpy().reshape(-1)
+            else:
+                forced_flat = forced_states.reshape(-1)
+            
+            
+            # Create a boolean mask for transitions where both t and t+1 are forced.
+            valid = (forced_flat[:-1] >= 0) & (forced_flat[1:] >= 0)  # shape (T-1,)
+            
+            # Get indices of transitions that are forced.
+            forced_idx = np.where(valid)[0]  # These are indices in the range [0, T-1)
+            
+            # For these forced transitions, zero out the entire row.
+            xi[forced_idx, :] = 0.0
+            
+            # Compute the positions for the forced transitions.
+            # For each valid index t, we want to set xi_new[t, forced_flat[t]*n_states + forced_flat[t+1]] = 1.
+            positions = forced_flat[forced_idx] * n_states + forced_flat[forced_idx + 1]
+            
+            # Use fancy indexing to assign 1.0 to these positions.
+            xi[forced_idx, positions.astype(int)] = 1.0
         return xi
         
     def get_posterior(self, x, ll_masks=None, forced_states=None):
@@ -731,6 +919,7 @@ class Model(ModelBase):
         likelihood : np.ndarray
             Likelihood. Shape is (n_states, batch_size*sequence_length).
         """
+        _logger.debug("Getting likelihood")
         # Get the current observation model parameters
         means, covs = self.get_means_covariances()
         n_states = means.shape[0]
@@ -751,7 +940,10 @@ class Model(ModelBase):
             )
             log_likelihood[state] = mvn.log_prob(x)
             if ll_masks is not None:
-                log_likelihood[state] = log_likelihood[state] * ll_masks[:,:,0]
+                _logger.debug(f"Mask shape {ll_masks.shape}, data shape {log_likelihood[state].shape} use_mask {self.config.use_mask}")
+                #print(ll_masks.shape)
+                #print(log_likelihood[state].shape)
+                log_likelihood[state] = log_likelihood[state] * tf.squeeze(ll_masks)#[:,:,0]
         log_likelihood = log_likelihood.reshape(n_states, batch_size * sequence_length)
         
 
@@ -1391,7 +1583,7 @@ class Model(ModelBase):
 
         return evidence
 
-    def get_alpha(self, dataset, concatenate=False, remove_edge_effects=False, ll_masks=None):
+    def get_alpha(self, dataset, concatenate=False, remove_edge_effects=False, ll_masks=None, forced_states=None):
         """Get state probabilities.
 
         Parameters
@@ -1424,7 +1616,9 @@ class Model(ModelBase):
         else:
             step_size = None
 
+        sampling_freq = dataset.sampling_frequency
         dataset = self.make_dataset(dataset, step_size=step_size)
+        dataset = self._make_combined_dataset(dataset, ll_masks, forced_states, sampling_freq, step_size=step_size,concatenate=False)
 
         n_datasets = len(dataset)
         if len(dataset) > 1:
@@ -1433,13 +1627,18 @@ class Model(ModelBase):
             iterator = range(n_datasets)
             _logger.info("Getting alpha")
 
+
         alpha = []
         for i in iterator:
             gamma = []
-            for j, data in enumerate(dataset[i]):
+            j = 0
+            for data in dataset[i]:
                 n_batches = dtf.get_n_batches(dataset[i])
-                x = data["data"]
-                g, _ = self.get_posterior(x,ll_masks=ll_masks)
+                
+                x, ll_masks, forced_states = self._unpack_inputs(data)
+
+                #x = data["data"]
+                g, _ = self.get_posterior(x,ll_masks=ll_masks, forced_states=forced_states)
                 if remove_edge_effects:
                     batch_size, sequence_length, _ = x.shape
                     n_states = g.shape[-1]
@@ -1458,6 +1657,7 @@ class Model(ModelBase):
                         g = [g[:, trim:-trim].reshape(-1, n_states)]
                     g = np.concatenate(g).reshape(-1, n_states)
                 gamma.append(g)
+                j += 1
             alpha.append(np.concatenate(gamma).astype(np.float32))
 
         if concatenate or len(alpha) == 1:

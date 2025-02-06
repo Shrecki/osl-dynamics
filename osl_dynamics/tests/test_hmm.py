@@ -14,7 +14,7 @@ from numpy.testing import (
 
 import osl_dynamics
 from osl_dynamics.models.hmm import Config, Model
-from osl_dynamics.data import Data
+from osl_dynamics.data import Data as Data
 from osl_dynamics.simulation import HMM_MVN
 
 import tensorflow as tf
@@ -848,7 +848,6 @@ def test_fit_mask_slight_differences():
     keras.backend.clear_session()
     
     assert np.any(np.abs(means_censored - means_full) > 1e-6)
-   
     
     
     
@@ -1055,3 +1054,566 @@ def test_override_xi_is_proper():
     v = np.array([[1,0,0],[0,0,0],[0,0,0]]).flatten()
     v_b = np.broadcast_to(v, m.shape)
     assert np.allclose(m,v_b)
+
+def test_gamma_correction():
+    """Gamma correction must:
+        - Set to 1 the posterior probability at time t of the specified state at time t, to 0 all other posteriors at time t
+        - Leave untouched at time t the posterior probabilities if the state is -1
+    """
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    state_seq = np.ones(1000*30)*(-1)
+    state_seq[200:250] = 0
+    state_seq[400:860] = 2
+    state_seq[900:920] = 1
+        
+    random_means = np.random.randn(3,10)
+    
+    ##########
+    # Generate data
+    ##########
+        
+    
+    ####
+    # Case 1: default model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    
+    gamma_r = np.abs(np.random.randn(1000*30,3))
+    
+    assert not np.allclose(gamma_r[200:250,0],1)
+    assert not np.allclose(gamma_r[400:860,2],1)
+    assert not np.allclose(gamma_r[900:920,1],1)
+
+    gamma_r_cpy = model.override_gamma(copy.deepcopy(gamma_r), state_seq)
+    del model
+    keras.backend.clear_session()
+    assert np.allclose(gamma_r_cpy[200:250,0],1)
+    assert np.allclose(gamma_r_cpy[200:250,1:],0)
+
+    assert np.allclose(gamma_r_cpy[400:860,2],1)
+    assert np.allclose(gamma_r_cpy[400:860,:2],0)
+    assert np.allclose(gamma_r_cpy[900:920,1],1)
+    assert np.allclose(gamma_r_cpy[900:920,0],0)
+    assert np.allclose(gamma_r_cpy[900:920,2],0)
+    
+    assert np.allclose(gamma_r_cpy[:200], gamma_r[:200])
+    assert np.allclose(gamma_r_cpy[250:400], gamma_r[250:400])
+    assert np.allclose(gamma_r_cpy[860:900], gamma_r[860:900])
+    assert np.allclose(gamma_r_cpy[920:], gamma_r[920:])
+    
+def test_xi_correction():
+    """Xi correction must:
+        - Set to 1 the joint probability (k,j) if s_t = k, s_t+1 = j, 0 to all other values
+        - Leave untouched at time t the joint probabilities if any of the two state is -1
+    """
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    state_seq = np.ones(1000*30)*(-1)
+    state_seq[200:202] = 0
+    state_seq[202:205] = 1
+    state_seq[205:220] = 0
+    state_seq[220:250] = 2
+
+    state_seq[400:860] = 2
+    state_seq[900:920] = 1
+        
+    random_means = np.random.randn(3,10)
+    
+    ##########
+    # Generate data
+    ##########
+        
+    
+    ####
+    # Case 1: default model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    
+    xi_r = np.abs(np.random.randn(1000*30 - 1,3*3))
+    
+    
+    assert not np.allclose(xi_r[200:201,0],1) # Case (0x0) => 0 (0*n_states + 0)
+    assert not np.allclose(xi_r[200:201,1:],0)
+
+    assert not np.allclose(xi_r[201:202,1],1) # Case (0 x 1) => 1 (0*n_states + 1)
+    assert not np.allclose(xi_r[201:202,0],0)
+    assert not np.allclose(xi_r[201:202,2:],0)
+
+    assert not np.allclose(xi_r[202:204,4],1) # Case (1 x 1) => 4 (1*n_states + 1)
+    assert not np.allclose(xi_r[202:204,:4],0)
+    assert not np.allclose(xi_r[202:204,5:],0)
+    
+    assert not np.allclose(xi_r[204:205,3],1) # Case (1 x 0) => 3 (1*n_states + 0)
+    assert not np.allclose(xi_r[204:205,:2],0)
+    assert not np.allclose(xi_r[204:205,4:],0)
+
+
+    xi_r_copy = model.override_xi(copy.deepcopy(xi_r), state_seq)
+    del model
+    keras.backend.clear_session()
+    print(xi_r_copy[200:202])
+    assert np.allclose(xi_r_copy[200:201,0],1) # Case (0x0) => 0 (0*n_states + 0)
+    assert np.allclose(xi_r_copy[200:201,1:],0)
+
+    assert np.allclose(xi_r_copy[201:202,1],1) # Case (0 x 1) => 1 (0*n_states + 1)
+    assert np.allclose(xi_r_copy[201:202,0],0)
+    assert np.allclose(xi_r_copy[201:202,2:],0)
+
+    assert np.allclose(xi_r_copy[202:204,4],1) # Case (1 x 1) => 4 (1*n_states + 1)
+    assert np.allclose(xi_r_copy[202:204,:4],0)
+    assert np.allclose(xi_r_copy[202:204,5:],0)
+    
+    assert np.allclose(xi_r_copy[204:205,3],1) # Case (1 x 0) => 3 (1*n_states + 0)
+    assert np.allclose(xi_r_copy[204:205,:2],0)
+    assert np.allclose(xi_r_copy[204:205,4:],0)
+    
+    assert np.allclose(xi_r_copy[205:219,0],1) # Case (0 x 0) => 0 (0*n_states + 0)
+    assert np.allclose(xi_r_copy[205:219,1:],0)
+    
+
+    assert np.allclose(xi_r_copy[219:220,2],1) # Case (0 x 2) => 2 (0*n_states + 2)
+    assert np.allclose(xi_r_copy[219:220,:2],0) # Case (0 x 2) => 2 (0*n_states + 2)
+    assert np.allclose(xi_r_copy[219:220,3:],0) # Case (0 x 2) => 2 (0*n_states + 2)
+
+
+    # Untouched parts should NOT have changed!
+    assert np.allclose(xi_r_copy[:200], xi_r[:200])
+    assert np.allclose(xi_r_copy[250:400], xi_r[250:400])
+    assert np.allclose(xi_r_copy[860:900], xi_r[860:900])
+    assert np.allclose(xi_r_copy[920:], xi_r[920:])
+
+def test_get_alpha_with_options_but_None_gives_base_val():
+    """
+    Calling get_alpha on default model and use_mask model with None mask or semi_supervised model with None state seq
+    must yield exactly the same results.
+    """    
+    ########
+    # Setup model parameters
+    ########
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    state_seq = np.ones(10000)*(-1)
+    state_seq[400:450]=1
+    state_seq[450:460] = 2
+        
+    random_means = np.random.randn(3,10)
+    
+    ##########
+    # Generate data
+    ##########
+    
+    data_ = np.random.randn(10000, 10)
+    data = Data([data_],time_axis_first=True, sampling_frequency=250.0)
+    mask = np.ones(10000,dtype=bool)
+    mask[400:700] = 0
+    mask[1350:1781] = 0
+    
+    keras.utils.set_random_seed(812)
+
+    
+    ####
+    # Case 1: default model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data)
+    alpha_base = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    
+    ####
+    # Case 2: masked model
+    ####
+    keras.utils.set_random_seed(812)
+
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        use_mask=True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data)
+    alpha_mask = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    
+    ####
+    # Case 3: state seq model
+    ####
+    keras.utils.set_random_seed(812)
+
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        semi_supervised=True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data)
+    alpha_state_seq = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    ##################
+    # Case 4: both
+    ##################
+    keras.utils.set_random_seed(812)
+
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        semi_supervised=True,        
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    #assert isinstance(data,list)
+    h = model.fit(data)
+    alpha_state_seq_mask = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    #state_seq[400:450]=1
+    #state_seq[450:460] = 2
+    
+    #assert alpha_state_seq_mask.shape == alpha_base.shape
+    #assert np.allclose(alpha_state_seq_mask[400:450,1],1) 
+    #assert alpha_state_seq_
+    assert np.allclose(alpha_base, alpha_state_seq)
+    assert np.allclose(alpha_base, alpha_state_seq_mask)
+    assert np.allclose(alpha_base, alpha_mask)
+    #assert True == False
+    
+def test_mask_influences_tc():
+    """
+    Masking with state censoring should affect
+    posterior state probabilities.
+    In particular, we should expect that the probabilities
+    which are hard set should be 1.
+    """
+    ########
+    # Setup model parameters
+    ########
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    state_seq = np.ones(10000)*(-1)
+    state_seq[400:450]=1
+    state_seq[450:460] = 2
+        
+    random_means = np.random.randn(3,10)
+    
+    ##########
+    # Generate data
+    ##########
+    
+    data_ = np.random.randn(10000, 10)
+    data = Data([data_],time_axis_first=True, sampling_frequency=250.0)
+    mask = np.ones(10000,dtype=bool)
+    mask[400:700] = 0
+    mask[1350:1781] = 0
+    
+    keras.utils.set_random_seed(812)
+
+    
+    ####
+    # Case 1: default model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data)
+    alpha_base = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    
+    ####
+    # Case 2: state seq model
+    ####
+    keras.utils.set_random_seed(812)
+
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        semi_supervised=True,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data, forced_states=state_seq)
+    alpha_state_seq = model.get_alpha(data, forced_states=state_seq)
+    del model
+    keras.backend.clear_session()
+    
+    ##################
+    # Case 3: both
+    ##################
+    keras.utils.set_random_seed(812)
+
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        semi_supervised=True,        
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    #assert isinstance(data,list)
+    h = model.fit(data, forced_states=state_seq)
+    alpha_state_seq_mask = model.get_alpha(data, forced_states=state_seq)
+    del model
+    keras.backend.clear_session()
+    
+    #assert np.allclose(alpha_state_seq_mask[400:450,1],1) 
+    #assert np.allclose(alpha_state_seq[400:450,1],1) 
+    #assert np.allclose(alpha_state_seq, alpha_state_seq_mask)
+
+    #assert not np.allclose(alpha_base, alpha_state_seq_mask)
+    
+def test_likelihood_mask():
+    """
+    Likelihood masking specific points is intended to
+    remove said points from the learning.
+    As such, learnt parameters should differ, specifically
+    in the case of outlying points.
+    """
+    assert True == False
+    
+def test_seed():
+    """
+    Calling get_alpha on default model and use_mask model with None mask or semi_supervised model with None state seq
+    must yield exactly the same results.
+    """    
+    ########
+    # Setup model parameters
+    ########
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    state_seq = np.ones(10000)*(-1)
+    state_seq[400:450]=1
+    state_seq[450:460] = 2
+        
+    random_means = np.random.randn(3,10)
+    
+    ##########
+    # Generate data
+    ##########
+    
+    data_ = np.random.randn(10000, 10)
+    data = Data([data_],time_axis_first=True, sampling_frequency=250.0)
+    mask = np.ones(10000,dtype=bool)
+    mask[400:700] = 0
+    mask[1350:1781] = 0
+    
+    keras.utils.set_random_seed(812)
+    ####
+    # Case 1: default model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data)
+    alpha_base = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    keras.utils.set_random_seed(812)
+     ####
+    # Case 1: default model
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=True,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=5,
+        multi_gpu = False,
+        initial_means=random_means,
+        initial_covariances=random_covs,
+        initial_trans_prob=random_T,
+        state_probs_t0 = np.ones(3)/3
+        
+    )
+    
+    model = Model(config)
+    h = model.fit(data)
+    alpha_two = model.get_alpha(data)
+    del model
+    keras.backend.clear_session()
+    
+    
+    assert np.allclose(alpha_base, alpha_two)
