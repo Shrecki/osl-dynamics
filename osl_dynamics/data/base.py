@@ -616,7 +616,7 @@ class Data:
         
         if component_offset < 0:
             raise ValueError("Please pass a non-negative component_offset.")
-        if not isinstance((component_offset, int)):
+        if not isinstance(component_offset, int):
             raise ValueError("component_offset must be a non-negative integer.")
 
         if pca_components is not None and not isinstance(pca_components, np.ndarray):
@@ -772,7 +772,7 @@ class Data:
         
         if component_offset < 0:
             raise ValueError("Please pass a non-negative component_offset.")
-        if not isinstance((component_offset, int)):
+        if not isinstance(component_offset, int):
             raise ValueError("component_offset must be a non-negative integer.")
 
 
