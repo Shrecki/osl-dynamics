@@ -996,7 +996,7 @@ class Model(ModelBase):
         sticky_counts = np.eye(self.config.n_states)
         phi_interim = (np.sum(xi, axis=0).reshape(
             self.config.n_states, self.config.n_states
-        ).T + sticky_counts)/ (np.sum(gamma[:-1], axis=0).reshape(self.config.n_states, 1))
+        ).T)/ (np.sum(gamma[:-1], axis=0).reshape(self.config.n_states, 1))
 
         # We use stochastic updates on trans_prob as per Eqs. (1) and (2) in the
         # paper:
