@@ -1618,7 +1618,7 @@ def test_seed():
     
     assert np.allclose(alpha_base, alpha_two)
     
-def test_hmm_kapp_increases_diag():
+def test_hmm_kappa_increases_diag():
     """The log likelihood of a data under 
        the observation model should be exactly the same
        when we consider the fully masked data,
@@ -1649,7 +1649,7 @@ def test_hmm_kapp_increases_diag():
         n_epochs=10,
         multi_gpu = False,
         use_mask= False,
-        kappa=20000
+        kappa=0.9
     )
     
     model = Model(config)

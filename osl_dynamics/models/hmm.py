@@ -99,8 +99,8 @@ class Config(BaseModelConfig):
         :code:`lr = config.learning_rate * exp(-observation_update_decay *
         epoch)`.
         
-    kappa: np.uint64
-        Stickiness parameter, biasing self transitions to make them more likely.
+    kappa: float
+        Stickiness parameter, biasing self transitions to make them more likely. In [0,1)
 
     batch_size : int
         Mini-batch size.
@@ -153,7 +153,7 @@ class Config(BaseModelConfig):
     observation_update_decay: float = 0.1
     
     # Transition model parameters
-    kappa: np.uint64 = 0
+    kappa: float = 0.0
     
     # Use masking or not
     use_mask: bool = False
@@ -185,7 +185,10 @@ class Config(BaseModelConfig):
 
             if not all(np.isclose(np.sum(self.initial_trans_prob, axis=1), 1)):
                 raise ValueError("rows of initial_trans_prob must sum to one.")
-
+        if not isinstance(self.kappa,float):
+            raise ValueError("kappa must be a float")
+        if self.kappa < 0 or self.kappa >= 1:
+            raise ValueError("kappa must be between 0 (inclusive) and 1 (exclusive)")
 
 class Model(ModelBase):
     """HMM class.
@@ -990,15 +993,16 @@ class Model(ModelBase):
         # by biasing towards longer dwell times in the transition matrix.
         # The denominator is also modified to ensure proper normalization.
         kappa = self.config.kappa
-        sticky_counts = np.eye(self.config.n_states) * kappa
+        sticky_counts = np.eye(self.config.n_states)
         phi_interim = (np.sum(xi, axis=0).reshape(
             self.config.n_states, self.config.n_states
-        ).T + sticky_counts)/ (np.sum(gamma[:-1], axis=0).reshape(self.config.n_states, 1) + kappa)
+        ).T + sticky_counts)/ (np.sum(gamma[:-1], axis=0).reshape(self.config.n_states, 1))
 
         # We use stochastic updates on trans_prob as per Eqs. (1) and (2) in the
         # paper:
         # https://www.sciencedirect.com/science/article/pii/S1053811917305487
         self.trans_prob = (1 - self.rho) * self.trans_prob + self.rho * phi_interim
+        self.trans_prob = (1-kappa)*self.trans_prob + sticky_counts*kappa
 
     def _update_rho(self, ind):
         """Update rho.
