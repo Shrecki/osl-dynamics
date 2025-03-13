@@ -1617,3 +1617,70 @@ def test_seed():
     
     
     assert np.allclose(alpha_base, alpha_two)
+    
+def test_hmm_kapp_increases_diag():
+    """The log likelihood of a data under 
+       the observation model should be exactly the same
+       when we consider the fully masked data,
+       the data with a :code:`None` log likelihood mask,
+       and the data under config without masking.
+    """
+    # Initialize unmasked config and model
+    # Set model parameters some means and covariances to define currently estimated state by the model
+
+    random_covs = np.zeros((3,10,10))
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    random_T = np.abs(np.random.randn(3,3))
+    for i in range(3):
+        random_T[i] /= random_T[i].sum()
+        
+    random_means = np.random.randn(3,10)
+        
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=False,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=10,
+        multi_gpu = False,
+        use_mask= False,
+        kappa=20000
+    )
+    
+    model = Model(config)
+
+
+    data = Data([np.random.randn(10000, 10)],time_axis_first=True, sampling_frequency=250.0)
+    
+    model.fit(data)
+    
+    trans_prob_1 = model.trans_prob
+    
+    
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        learn_means=False,
+        learn_covariances=True,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=10,
+        multi_gpu = False,
+        use_mask= False,
+    )
+    
+    model = Model(config)
+    model.fit(data)
+    
+    
+    trans_prob_2 = model.trans_prob
+
+
+    assert np.all(np.diag(trans_prob_1) > np.diag(trans_prob_2))
+    

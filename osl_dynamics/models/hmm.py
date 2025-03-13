@@ -98,6 +98,9 @@ class Config(BaseModelConfig):
         We update the learning rate (:code:`lr`) as
         :code:`lr = config.learning_rate * exp(-observation_update_decay *
         epoch)`.
+        
+    kappa: np.uint64
+        Stickiness parameter, biasing self transitions to make them more likely.
 
     batch_size : int
         Mini-batch size.
@@ -148,6 +151,9 @@ class Config(BaseModelConfig):
     trans_prob_update_delay: float = 5  # alpha
     trans_prob_update_forget: float = 0.7  # beta
     observation_update_decay: float = 0.1
+    
+    # Transition model parameters
+    kappa: np.uint64 = 0
     
     # Use masking or not
     use_mask: bool = False
@@ -979,9 +985,15 @@ class Model(ModelBase):
         #                = sum^{T-1}_{t=1} xi(t, t+1) / sum^{T-1}_{t=1} gamma(t)
         #
         # where E{.} denotes the expectation.
-        phi_interim = np.sum(xi, axis=0).reshape(
+        #
+        # xi(t,t+1)[i,i] is modified as xi(t,t+1)[i,i] + kappa, allowing for "sticky" HMM
+        # by biasing towards longer dwell times in the transition matrix.
+        # The denominator is also modified to ensure proper normalization.
+        kappa = self.config.kappa
+        sticky_counts = np.eye(self.config.n_states) * kappa
+        phi_interim = (np.sum(xi, axis=0).reshape(
             self.config.n_states, self.config.n_states
-        ).T / np.sum(gamma[:-1], axis=0).reshape(self.config.n_states, 1)
+        ).T + sticky_counts)/ (np.sum(gamma[:-1], axis=0).reshape(self.config.n_states, 1) + kappa)
 
         # We use stochastic updates on trans_prob as per Eqs. (1) and (2) in the
         # paper:
