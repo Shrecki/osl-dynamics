@@ -1621,6 +1621,74 @@ class CategoricalLogLikelihoodLossLayerMasked(layers.Layer):
         return tf.expand_dims(nll_loss, axis=-1)
 
 
+class CategoricalWishartLogLikelihoodLossLayer(layers.Layer):
+    """Layer to calculate the log-likelihood loss assuming a categorical Wishart model.
+
+    Parameters
+    ----------
+    df: int
+        Degrees of freedom parameter of the covariances (how many samples used to calculate them)
+    n_states : int
+        Number of states.
+    epsilon : float
+        Error added to the covariances for numerical stability.
+    calculation : str
+        Operation for reducing the time dimension. Either 'mean' or 'sum'.
+    kwargs : keyword arguments, optional
+        Keyword arguments to pass to the base class.
+    """
+
+    def __init__(self, df, n_states, epsilon, calculation, **kwargs):
+        super().__init__(**kwargs)
+        self.n_states = n_states
+        self.epsilon = epsilon
+        self.calculation = calculation
+        self.df = df
+
+    def call(self, inputs, **kwargs):
+        x, sigma, probs, session_id = inputs
+        
+        print(f"X shape: {x.shape}")
+
+        # Add a small error for numerical stability
+        sigma = add_epsilon(sigma, self.epsilon, diag=True)
+
+        if session_id is not None:
+            # Get the mean and covariance for the requested array
+            session_id = tf.cast(session_id, tf.int32)
+            sigma = tf.gather(sigma, session_id)
+            
+        # Bijector to put back to full matrix form
+        fill_triangular = tfp.bijectors.FillTriangular()
+
+
+        # Log-likelihood for each state
+        ll_loss = tf.zeros(shape=tf.shape(x)[:-1])
+        for i in range(self.n_states):
+            mvn = tfp.distributions.WishartTriL(
+                df=self.df,
+                scale_tril=tf.linalg.cholesky(tf.gather(sigma, i, axis=-3)),
+                input_output_cholesky=True,
+                allow_nan_stats=False,
+            )
+            a = mvn.log_prob(fill_triangular(x))
+            ll_loss += probs[:, :, i] * a
+
+        if self.calculation == "sum":
+            # Sum over time dimension and average over the batch dimension
+            ll_loss = tf.reduce_sum(ll_loss, axis=1)
+            ll_loss = tf.reduce_mean(ll_loss, axis=0)
+        else:
+            # Average over time and batches
+            ll_loss = tf.reduce_mean(ll_loss, axis=(0, 1))
+
+        # Add the negative log-likelihood to the loss
+        nll_loss = -ll_loss
+        self.add_loss(nll_loss)
+        self.add_metric(nll_loss, name=self.name)
+
+        return tf.expand_dims(nll_loss, axis=-1)
+
 
 class CategoricalPoissonLogLikelihoodLossLayer(layers.Layer):
     """Layer to calculate the log-likelihood loss assuming a categorical model

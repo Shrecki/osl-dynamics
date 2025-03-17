@@ -841,7 +841,10 @@ class Model(ModelBase):
             time points, :math:`q(s_t, s_{t+1})`. Shape is
             (batch_size*sequence_length-1, n_states*n_states).
         """
-        B = self.get_likelihood(x, ll_masks=ll_masks)
+        if ll_masks is None:
+            B = self.get_likelihood(x)
+        else:
+            B = self.get_likelihood(x, ll_masks=ll_masks)
         Pi_0 = self.state_probs_t0
         P = self.trans_prob
         gamma, xi = self.baum_welch(B, Pi_0, P)

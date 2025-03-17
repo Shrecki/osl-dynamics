@@ -1,0 +1,91 @@
+"""
+Authors: Fabrice Guibert
+
+"""
+
+import numpy as np
+import pytest
+from numpy.testing import (
+    assert_allclose,
+    assert_array_almost_equal,
+    assert_array_equal,
+    assert_array_less,
+)
+
+import osl_dynamics
+from osl_dynamics.models.hmm_wishart import Config, Model
+from osl_dynamics.data import Data as Data
+
+import tensorflow as tf
+import keras
+import copy
+import sys
+
+
+def test_hmm_wishart_no_crash():
+    """When using a Wishart observation model, we don't expect
+    to see errors. We will feed a simplified case
+    with non-random cholesky factors and assess
+    we get indeed all the proper covariances recovered.
+    """
+    # Initialize unmasked config and model
+    # Set model parameters some means and covariances to define currently estimated state by the model
+
+    random_covs = np.zeros((3,10,10))
+    
+    for i in range(3):
+        a = np.random.randn(10,10)
+        random_covs[i] = a.T @ a
+    import tensorflow_probability as tfp
+    random_choleskys = tfp.math.fill_triangular_inverse(np.linalg.cholesky(random_covs)) #[:,idx[0],idx[1]]
+    # Create now fake data!
+    
+    from scipy.stats import wishart as wishart_scipy
+    
+    fake_data = np.zeros((3000, 55))
+    fake_data[:1000] = tfp.math.fill_triangular_inverse(np.linalg.cholesky(wishart_scipy(df=90, scale = random_covs[0]).rvs(1000)))
+    fake_data[1000:2000] = tfp.math.fill_triangular_inverse(np.linalg.cholesky(wishart_scipy(df=90, scale = random_covs[1]).rvs(1000)))
+    fake_data[2000:] = tfp.math.fill_triangular_inverse(np.linalg.cholesky(wishart_scipy(df=90, scale = random_covs[2]).rvs(1000)))
+    
+        
+    from sklearn.cluster import KMeans
+    
+    kmeans_model = KMeans(3)
+    kmeans_model.fit(fake_data)
+            
+    recovered_cholesky = tfp.math.fill_triangular(kmeans_model.cluster_centers_)
+    recovered_covs = tf.linalg.matmul(recovered_cholesky, recovered_cholesky, transpose_b=True)
+
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=50,
+        learn_covariances=True,
+        initial_covariances=recovered_covs.numpy(),
+        multi_gpu = False,
+        window_size = 90
+    )
+    
+    model = Model(config)
+    print(model.summary())
+    
+    data = Data([fake_data],time_axis_first=True, sampling_frequency=250.0)
+
+    #model.random_state_time_course_initialization(data, n_epochs=1, n_init=10)
+    
+    #dataset = data.dataset(1000,30)
+    
+    model.fit(data.dataset(1000,30))
+    
+    probas =  model.get_alpha(data)
+    
+    state_0 = np.argmax(probas[0])
+    state_1 = np.argmax(probas[1500])
+    state_2 = np.argmax(probas[2500])
+
+    assert np.allclose(probas[:1000,state_0], 1)
+    assert np.allclose(probas[1000:2000,state_1], 1)
+    assert np.allclose(probas[2000:,state_2], 1)
