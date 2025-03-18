@@ -1139,7 +1139,11 @@ class Data:
                 array = cholesky_vectorize(cov)
             elif approach == "batch_fft": 
                 all_batches = []
-                for batch in compute_sliding_covariances_batches(array,min(max(n_window*10, 10000),array.shape[0])):
+                i = 0
+                batch_size = min(max(n_window*10, 10000),array.shape[0])
+                print(f"Batch size: {batch_size}")
+                for batch in compute_sliding_covariances_batches(array,batch_size):
+                    print(f"batch {i} done")
                     all_batches.append(batch)
                 array = np.concatenate(all_batches, axis=0)               
             elif approach == "naive":
