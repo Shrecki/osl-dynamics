@@ -80,6 +80,19 @@ def test_sliding_window_covar_correct():
         # Compare up to errors
         for i in range(len(input_data.arrays)):
             assert np.allclose(input_data.arrays[i], expected_covars[i],atol=1e-4)
+        
+        # Same for batched FFT    
+        input_data = Data(orig_data,sampling_frequency=1.0,time_axis_first=True)
+        input_data.moving_covar_cholesky_vectorized(window,approach="batch_fft")
+        
+        for i in range(len(input_data.arrays)):
+            assert np.allclose(input_data.arrays[i], expected_covars[i],atol=1e-4)
+            
+        input_data = Data(orig_data,sampling_frequency=1.0,time_axis_first=True)
+        input_data.moving_covar_cholesky_vectorized(window,approach="naive")
+        
+        for i in range(len(input_data.arrays)):
+            assert np.allclose(input_data.arrays[i], expected_covars[i],atol=1e-4)
             
 def test_different_sliding_windows_produce_different_covars():
     """

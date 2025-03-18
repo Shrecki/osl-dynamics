@@ -19,6 +19,9 @@ from tqdm.auto import tqdm
 from osl_dynamics.data import processing, rw, tf as dtf
 from osl_dynamics.utils import misc
 
+import tensorflow_probability as tfp
+
+
 _logger = logging.getLogger("osl-dynamics")
 
 
@@ -955,7 +958,7 @@ class Data:
 
         return self
     
-    def moving_covar_cholesky_vectorized(self,n_window,use_raw=False, use_fft=False):
+    def moving_covar_cholesky_vectorized(self,n_window,use_raw=False, approach="fft"):
         """Sliding-window covariance.
         
         This function will compute a sliding-window covariance, per array,
@@ -1052,22 +1055,102 @@ class Data:
             return chol_np
 
 
+        def compute_sliding_covariances_batches(array, batch_size):
+            """
+            Compute sliding-window covariance matrices in batches and return
+            their vectorized Cholesky factors. The computation is done in batches
+            over the "valid" sliding-window outputs, so no edge effects are introduced.
+            
+            Parameters
+            ----------
+            array : np.ndarray
+                Input data of shape (n_samples, n_vars).
+            batch_size : int
+                Number of windows to process in each batch.
+            
+            Yields
+            ------
+            chol_vectorized_batch : np.ndarray
+                Batch of vectorized Cholesky factors, of shape 
+                (batch_size_current, n_triangular_elements) where 
+                n_triangular_elements = n_vars*(n_vars+1)//2.
+            """
+
+            n_samples, n_vars = array.shape
+            valid_length = n_samples - n_window + 1  # number of valid sliding windows
+            
+            # Precompute moving averages for each variable over the full valid region.
+            # For a given channel j, we compute the convolution with a boxcar kernel.
+            kernel = np.ones(n_window) / n_window
+            means = np.empty((valid_length, n_vars))
+            for j in range(n_vars):
+                # np.convolve(x, kernel, mode='valid') returns the moving average over all valid windows.
+                means[:, j] = np.convolve(array[:, j], kernel, mode='valid')
+            
+            # Process valid windows in batches.
+            for start in range(0, valid_length, batch_size):
+                end = min(start + batch_size, valid_length)
+                batch_length = end - start
+                
+                # Initialize an array to hold covariance matrices for this batch.
+                # Shape: (n_vars, n_vars, batch_length)
+                covs_batch = np.zeros((n_vars, n_vars, batch_length))
+                
+                # Diagonal entries: For each variable j, compute moving average of x^2.
+                for j in range(n_vars):
+                    moving_prod = np.convolve(array[:, j]**2, kernel, mode='valid')[start:end]
+                    # Sample covariance formula: Var = (E[x^2] - (E[x])^2) scaled appropriately.
+                    covs_batch[j, j, :] = moving_prod - means[start:end, j]**2
+
+                # Off-diagonal entries: For each pair (i,j), i < j.
+                for i in range(n_vars):
+                    for j in range(i+1, n_vars):
+                        moving_prod = np.convolve(array[:, i] * array[:, j], kernel, mode='valid')[start:end]
+                        cov_ij = moving_prod - means[start:end, i] * means[start:end, j]
+                        covs_batch[i, j, :] = cov_ij
+                        covs_batch[j, i, :] = cov_ij
+                
+                # Scale to get the unbiased sample covariance.
+                # Note: Using the fact that 
+                #   unbiased_cov = (L / (L-1)) * (E[x^2] - (E[x])^2)
+                covs_batch = covs_batch * n_window / (n_window - 1)
+                
+                # Transpose to have shape (batch_length, n_vars, n_vars)
+                covs_batch = np.transpose(covs_batch, (2, 0, 1))
+                
+                # Compute the Cholesky decomposition for each covariance matrix in the batch.
+                # Here we assume the covariances are positive-definite.
+                chol_batch = np.linalg.cholesky(covs_batch)
+                
+                # Vectorize the lower-triangular Cholesky factors using TensorFlow Probability.
+                # tfp.math.fill_triangular_inverse orders the entries row-by-row.
+                chol_vectorized_batch = tfp.math.fill_triangular_inverse(chol_batch).numpy()
+                
+                yield chol_vectorized_batch
+
         # Function to compute covariance
         def _apply(array, prepared_data_file):
             import tensorflow_probability as tfp
-            if use_fft:
+            if approach == "fft":
                 # Compute with FFT covariances
                 cov = sliding_cov_fft(array, self.n_window)
                 
                 # Decompose each covariance as vectorized Cholesky factor
                 array = cholesky_vectorize(cov)
-            else:
+            elif approach == "batch_fft": 
+                all_batches = []
+                for batch in compute_sliding_covariances_batches(array,min(max(n_window*10, 10000),array.shape[0])):
+                    all_batches.append(batch)
+                array = np.concatenate(all_batches, axis=0)               
+            elif approach == "naive":
                 n_samples, n_vars = array.shape
                 valid_length = n_samples - n_window + 1
                 cholesky_res = np.zeros((valid_length, int(n_vars*(n_vars+1)/2)))
                 for i in range(valid_length):
                     cholesky_res[i] = tfp.math.fill_triangular_inverse(np.linalg.cholesky(np.cov(array[i:i+n_window], rowvar=False)))
                 array = cholesky_res
+            else:
+                raise NotImplementedError(f"approach can only be fft, batch_fft or naive, but was {approach}")
             # Return result
             if self.load_memmaps:
                 array = misc.array_to_memmap(prepared_data_file, array)
