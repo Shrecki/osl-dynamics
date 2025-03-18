@@ -1155,17 +1155,10 @@ class Data:
             if self.load_memmaps:
                 array = misc.array_to_memmap(prepared_data_file, array)
             return array
-
-        # Apply PCA in parallel
-        args = zip(arrays, self.prepared_data_filenames)
-        self.arrays = pqdm(
-            args,
-            function=_apply,
-            desc="Sliding window covariance",
-            n_jobs=self.n_jobs,
-            argument_type="args",
-            total=self.n_sessions,
-        )
+        
+        for i in tqdm(range(len(arrays)), desc="Sliding window covariance"):
+            array = arrays[i]
+            self.arrays[i] = _apply(array,self.prepared_data_filenames)
         
         self.n_covar_channels = self.arrays[0].shape[1]
         
