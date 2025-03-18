@@ -43,7 +43,7 @@ def test_sliding_window_incorrect_channels_spec():
         input_data.moving_covar_cholesky_vectorized(3)
     with pytest.raises(ValueError):
         input_data.moving_covar_cholesky_vectorized(10.0)
-    
+    input_data.prepare({'moving_covar_cholesky_vectorized': {'n_window': 10}})
 
 def test_sliding_window_covar_correct():
     """

@@ -955,7 +955,7 @@ class Data:
 
         return self
     
-    def moving_covar_cholesky_vectorized(self,n_window,use_raw=False):
+    def moving_covar_cholesky_vectorized(self,n_window,use_raw=False, use_fft=False):
         """Sliding-window covariance.
         
         This function will compute a sliding-window covariance, per array,
@@ -1054,11 +1054,20 @@ class Data:
 
         # Function to compute covariance
         def _apply(array, prepared_data_file):
-            # Compute with FFT covariances
-            cov = sliding_cov_fft(array, self.n_window)
-            
-            # Decompose each covariance as vectorized Cholesky factor
-            array = cholesky_vectorize(cov)
+            import tensorflow_probability as tfp
+            if use_fft:
+                # Compute with FFT covariances
+                cov = sliding_cov_fft(array, self.n_window)
+                
+                # Decompose each covariance as vectorized Cholesky factor
+                array = cholesky_vectorize(cov)
+            else:
+                n_samples, n_vars = array.shape
+                valid_length = n_samples - n_window + 1
+                cholesky_res = np.zeros((valid_length, int(n_vars*(n_vars+1)/2)))
+                for i in range(valid_length):
+                    cholesky_res[i] = tfp.math_fill_triangular_inverse(np.linalg.cholesky(np.cov(array[i:i+n_window], rowvar=False)))
+                array = cholesky_res
             # Return result
             if self.load_memmaps:
                 array = misc.array_to_memmap(prepared_data_file, array)
