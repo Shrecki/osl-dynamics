@@ -62,7 +62,7 @@ def test_hmm_wishart_no_crash():
         sequence_length=1000,
         batch_size=30,
         learning_rate=0.01,
-        n_epochs=50,
+        n_epochs=1000,
         learn_covariances=True,
         initial_covariances=recovered_covs.numpy(),
         multi_gpu = False,
@@ -76,16 +76,52 @@ def test_hmm_wishart_no_crash():
 
     #model.random_state_time_course_initialization(data, n_epochs=1, n_init=10)
     
+    # Sometimes predicted probas get in NaN territory
+    # Then, covariances themselves become NaN (as you'd expect)
+    # Where is the NaN coming from? 
+    # Could be an issue of stability, but where?
+    
     #dataset = data.dataset(1000,30)
     
     model.fit(data.dataset(1000,30))
     
     probas =  model.get_alpha(data)
     
-    state_0 = np.argmax(probas[0])
-    state_1 = np.argmax(probas[1500])
-    state_2 = np.argmax(probas[2500])
+    state_0 = np.argmax(probas[:1000].mean(axis=0))
+    state_1 = np.argmax(probas[1000:2000].mean(axis=0))
+    state_2 = np.argmax(probas[2000:].mean(axis=0))
+    
+    print(probas)
+    
+    if(np.any(np.isnan(probas))):
+        print(model.get_covariances())
+    
+    assert state_0 != state_1
+    assert state_1 != state_2
 
     assert np.allclose(probas[:1000,state_0], 1)
     assert np.allclose(probas[1000:2000,state_1], 1)
     assert np.allclose(probas[2000:,state_2], 1)
+
+
+def test_hmm_wishart_synthetic_dataset():
+    """
+    A test where we generate a dataset from a mixture of multivariate gaussians.
+    We then compute a sliding-window covariance matrix from the data (using the "prepare" method)
+    and feed it to the model.
+    
+    @todo: a prepare method in the data class to enable the rest
+    """
+    
+    # Generate a list of random state changes.
+    # We start from a purely ordered list and slightly perturb it.
+    # Expectation: window size will remove instantaneous observations,
+    # leading to smooth state timecourses
+    
+    # Generate MV gaussian samples for each state
+    
+    # Assign to time series
+    
+    # Transform as vectorized Cholesky of sliding-window covars
+    
+    # Initialize model and train (we hope for no errors!)

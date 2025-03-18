@@ -473,6 +473,21 @@ class Model(HMM):
             )
 
         return np.squeeze(results)
+    
+    def kmeans_time_course_initialization(self,data):
+        from sklearn.cluster import KMeans
+        kmeans_model = KMeans(self.config.n_states)
+        
+        # @todo: Replace here with correct way to walk through dataset! (Perhaps online update? To be considered!)
+        kmeans_model.fit(data)
+        
+        recovered_cholesky = tfp.math.fill_triangular(kmeans_model.cluster_centers_)
+        recovered_covs = tf.linalg.matmul(recovered_cholesky, recovered_cholesky, transpose_b=True)
+        
+        if self.config.learn_covariances:
+            # Set initial covariances
+            self.set_covariances(recovered_covs, update_initializer=True)
+
 
     def _model_structure(self):
         """Build the model structure."""

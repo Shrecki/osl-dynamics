@@ -954,6 +954,138 @@ class Data:
             raise e
 
         return self
+    
+    def moving_covar_cholesky_vectorized(self,n_window,use_raw=False):
+        """Sliding-window covariance.
+        
+        This function will compute a sliding-window covariance, per array,
+        using n_window samples for each covariance matrix.
+        Covariance matrices are then decomposed as their vectorized Cholesky
+        factors, to reduce storage requirements.
+        
+        This is an in-place operation.
+
+        Parameters
+        ----------
+        n_window : int
+            Number of samples to compute any covariance matrix. Must be at least equal to number of channels.
+        use_raw : bool, optional
+            Should we prepare the original 'raw' data that we loaded?
+
+        Returns
+        -------
+        data : osl_dynamics.data.Data
+            The modified Data object.
+        """
+        if n_window is None:
+            raise ValueError("Please pass n_window.")
+        if not isinstance(n_window, int) or n_window < 1:
+            raise ValueError("n_window should be a non-negative integer.")
+        
+        if n_window < self.n_channels:
+            raise ValueError("n_window should be at least the number of channels for covariances to be defined.")
+        
+        self.n_window = n_window
+
+        # What data should we use?
+        arrays = self.raw_data_arrays if use_raw else self.arrays
+        
+        
+        def fft_moving_average(array, L):
+            """
+            Compute the moving average of a 1D array x with window length L using FFT convolution.
+            """
+            n = len(array)
+            kernel = np.ones(L) / L
+            # Next power of 2 for zero-padding (efficient FFT computation)
+            nfft = np.power(2, np.ceil(np.log2(n + L - 1)).astype(int))
+            array_fft = np.fft.rfft(array, n=nfft)
+            kernel_fft = np.fft.rfft(kernel, n=nfft)
+            conv = np.fft.irfft(array_fft * kernel_fft, n=nfft)[:n + L - 1]
+            # We only need the 'valid' part: indices L-1 to n-1
+            return conv[L-1:n]
+
+        def sliding_cov_fft(array, L):
+            """
+            Compute sliding-window covariance matrices using FFT-based convolution.
+            X: np.ndarray of shape (n_samples, n_vars)
+            L: window length
+            
+            Returns:
+                covs: list of covariance matrices for each window (length n_samples - L + 1)
+            """
+            n_samples, n_vars = array.shape
+            valid_length = n_samples - L + 1
+            
+            # Compute moving averages for each variable
+            means = np.empty((valid_length, n_vars))
+            for j in range(n_vars):
+                means[:, j] = fft_moving_average(array[:, j], L)
+            
+            # Precompute moving averages for products: for each pair (i,j)
+            # We'll store the covariance matrices for each window
+            covs = np.zeros((n_vars, n_vars,valid_length))
+            
+            # Compute for diagonal elements first (variance)
+            for j in range(n_vars):
+                moving_prod = fft_moving_average(array[:, j] * array[:, j], L)
+                # Covariance for variable j with itself: E[x^2] - (E[x])^2
+                covs_diag = moving_prod - means[:, j]**2
+                covs[j,j,:] = covs_diag
+
+                
+            # Now compute off-diagonals (symmetric)
+            for i in range(n_vars):
+                for j in range(i+1, n_vars):
+                    moving_prod = fft_moving_average(array[:, i] * array[:, j], L)
+                    cov_ij = moving_prod - means[:, i] * means[:, j]
+                    covs[i,j] = cov_ij
+                    covs[j,i] = cov_ij
+            covs *= L
+            covs /= (L-1)
+            return covs    
+
+        def cholesky_vectorize(cov):
+            import tensorflow_probability as tfp
+            cov = np.transpose(cov, (2, 0, 1))
+            chol_np = tfp.math.fill_triangular_inverse(np.linalg.cholesky(cov))
+            return chol_np
+
+
+        # Function to compute covariance
+        def _apply(array, prepared_data_file):
+            # Compute with FFT covariances
+            cov = sliding_cov_fft(array, self.n_window)
+            
+            # Decompose each covariance as vectorized Cholesky factor
+            array = cholesky_vectorize(cov)
+            # Return result
+            if self.load_memmaps:
+                array = misc.array_to_memmap(prepared_data_file, array)
+            return array
+
+        # Apply PCA in parallel
+        args = zip(arrays, self.prepared_data_filenames)
+        self.arrays = pqdm(
+            args,
+            function=_apply,
+            desc="Sliding window covariance",
+            n_jobs=self.n_jobs,
+            argument_type="args",
+            total=self.n_sessions,
+        )
+        
+        self.n_covar_channels = self.arrays[0].shape[1]
+        
+        
+        if any([isinstance(e, Exception) for e in self.arrays]):
+            for i, e in enumerate(self.arrays):
+                if isinstance(e, Exception):
+                    e.args = (f"array {i}: {e}",)
+                    _logger.exception(e, exc_info=False)
+            raise e
+
+        return self
 
     def align_channel_signs(
         self,
