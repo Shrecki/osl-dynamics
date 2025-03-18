@@ -1066,7 +1066,7 @@ class Data:
                 valid_length = n_samples - n_window + 1
                 cholesky_res = np.zeros((valid_length, int(n_vars*(n_vars+1)/2)))
                 for i in range(valid_length):
-                    cholesky_res[i] = tfp.math_fill_triangular_inverse(np.linalg.cholesky(np.cov(array[i:i+n_window], rowvar=False)))
+                    cholesky_res[i] = tfp.math.fill_triangular_inverse(np.linalg.cholesky(np.cov(array[i:i+n_window], rowvar=False)))
                 array = cholesky_res
             # Return result
             if self.load_memmaps:
