@@ -475,14 +475,14 @@ class Model(HMM):
         return np.squeeze(results)
     
     def kmeans_time_course_initialization(self,data):
-        from sklearn.cluster import KMeans
-        kmeans_model = KMeans(self.config.n_states)
+        from sklearn.cluster import MiniBatchKMeans
+        kmeans_model = MiniBatchKMeans(self.config.n_states)
         
-        # @todo: Replace here with correct way to walk through dataset! (Perhaps online update? To be considered!)
-        kmeans_model.fit(data)
+        for array in data.arrays:
+            kmeans_model.partial_fit(array)
         
         recovered_cholesky = tfp.math.fill_triangular(kmeans_model.cluster_centers_)
-        recovered_covs = tf.linalg.matmul(recovered_cholesky, recovered_cholesky, transpose_b=True)
+        recovered_covs = tf.linalg.matmul(recovered_cholesky, recovered_cholesky, transpose_b=True).numpy()
         
         if self.config.learn_covariances:
             # Set initial covariances

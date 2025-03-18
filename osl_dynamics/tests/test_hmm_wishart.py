@@ -21,6 +21,40 @@ import keras
 import copy
 import sys
 
+def test_hmm_wishart_kmeans_init():
+    window = 50
+    #####
+    # Create dataset
+    #####
+    n_c = 4
+    n_s = [4000,14000,19000]
+    
+    orig_data = [np.random.randn(samples,n_c) for samples in n_s]
+    input_data =Data(orig_data,sampling_frequency=1.0)
+    input_data.moving_covar_cholesky_vectorized(window)
+    
+    ####
+    # Create model config
+    ####
+    config = Config(
+        n_states=3,
+        n_channels=n_c,
+        sequence_length=1000,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=1000,
+        learn_covariances=True,
+        multi_gpu = False,
+        window_size = window
+    )
+    
+    model = Model(config)
+    
+    ####
+    # Call k-means initialization and assert no throw
+    ####
+    model.kmeans_time_course_initialization(input_data)
+
 
 def test_hmm_wishart_no_crash():
     """When using a Wishart observation model, we don't expect
@@ -74,15 +108,6 @@ def test_hmm_wishart_no_crash():
     
     data = Data([fake_data],time_axis_first=True, sampling_frequency=250.0)
 
-    #model.random_state_time_course_initialization(data, n_epochs=1, n_init=10)
-    
-    # Sometimes predicted probas get in NaN territory
-    # Then, covariances themselves become NaN (as you'd expect)
-    # Where is the NaN coming from? 
-    # Could be an issue of stability, but where?
-    
-    #dataset = data.dataset(1000,30)
-    
     model.fit(data.dataset(1000,30))
     
     probas =  model.get_alpha(data)
@@ -108,9 +133,7 @@ def test_hmm_wishart_synthetic_dataset():
     """
     A test where we generate a dataset from a mixture of multivariate gaussians.
     We then compute a sliding-window covariance matrix from the data (using the "prepare" method)
-    and feed it to the model.
-    
-    @todo: a prepare method in the data class to enable the rest
+    and feed it to the model.    
     """
     
     # Generate a list of random state changes.

@@ -1048,7 +1048,7 @@ class Data:
         def cholesky_vectorize(cov):
             import tensorflow_probability as tfp
             cov = np.transpose(cov, (2, 0, 1))
-            chol_np = tfp.math.fill_triangular_inverse(np.linalg.cholesky(cov))
+            chol_np = tfp.math.fill_triangular_inverse(np.linalg.cholesky(cov)).numpy()
             return chol_np
 
 
