@@ -20,6 +20,7 @@ from osl_dynamics.data import processing, rw, tf as dtf
 from osl_dynamics.utils import misc
 
 import tensorflow_probability as tfp
+from osl_dynamics.inference import batched_cov
 
 
 _logger = logging.getLogger("osl-dynamics")
@@ -1144,15 +1145,18 @@ class Data:
                 print(f"Batch size: {batch_size}")
                 for batch in compute_sliding_covariances_batches(array,batch_size):
                     print(f"batch {i} done")
+                    i = i+1
                     all_batches.append(batch)
                 array = np.concatenate(all_batches, axis=0)               
             elif approach == "naive":
                 n_samples, n_vars = array.shape
                 valid_length = n_samples - n_window + 1
                 cholesky_res = np.zeros((valid_length, int(n_vars*(n_vars+1)/2)))
-                for i in range(valid_length):
+                for i in tqdm(range(valid_length), desc="Timestep"):
                     cholesky_res[i] = tfp.math.fill_triangular_inverse(np.linalg.cholesky(np.cov(array[i:i+n_window], rowvar=False)))
                 array = cholesky_res
+            elif approach =="batch_cython":
+                array = batched_cov(array,n_window, batch_size)[1]
             else:
                 raise NotImplementedError(f"approach can only be fft, batch_fft or naive, but was {approach}")
             # Return result

@@ -14,6 +14,7 @@ from numpy.testing import (
 
 import osl_dynamics
 from osl_dynamics.data import Data as Data
+from osl_dynamics.inference import batched_cov
 
 import tensorflow as tf
 import tensorflow_probability as tfp
@@ -21,6 +22,37 @@ import keras
 import copy
 import sys
 
+def test_sliding_window_cov_naive():
+    n_c = 4
+    n_s = [1000]
+    
+    orig_data = [np.random.randn(samples,n_c) for samples in n_s] 
+    
+    import time
+    
+    start = time.time()
+    for i in range(100):
+        input_data = Data(orig_data,sampling_frequency=1.0,time_axis_first=True)
+        
+        # Naive preparation
+        input_data.prepare({'moving_covar_cholesky_vectorized': {'n_window': 10, 'approach':'naive'}})
+    end = time.time()
+    print((end-start)/100)
+    # "Optimized" preparation
+    
+def test_sliding_window_cov_optim():
+    n_c = 4
+    n_s = [1000]
+    
+    orig_data = [np.random.randn(samples,n_c) for samples in n_s] 
+    import time
+    
+    start = time.time()
+    for i in range(100):
+        out = batched_cov.batched_covariance_and_cholesky(orig_data[0],10,1000)
+    end = time.time()
+    print((end-start)/100)
+    
 
 def test_sliding_window_incorrect_channels_spec():
     """
