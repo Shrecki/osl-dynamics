@@ -959,7 +959,7 @@ class Data:
 
         return self
     
-    def moving_covar_cholesky_vectorized(self,n_window,use_raw=False, approach="fft"):
+    def moving_covar_cholesky_vectorized(self,n_window,use_raw=False, approach="naive", batch_size=None):
         """Sliding-window covariance.
         
         This function will compute a sliding-window covariance, per array,
@@ -975,6 +975,10 @@ class Data:
             Number of samples to compute any covariance matrix. Must be at least equal to number of channels.
         use_raw : bool, optional
             Should we prepare the original 'raw' data that we loaded?
+        approach: string, optional
+            Approach to use, can be naive, fft, batch_fft, batch_cython
+        batch_size: int, optional
+            Batch size. Only used in batch approaches.
 
         Returns
         -------
@@ -1141,7 +1145,6 @@ class Data:
             elif approach == "batch_fft": 
                 all_batches = []
                 i = 0
-                batch_size = min(max(n_window*10, 10000),array.shape[0])
                 print(f"Batch size: {batch_size}")
                 for batch in compute_sliding_covariances_batches(array,batch_size):
                     print(f"batch {i} done")
@@ -1156,7 +1159,7 @@ class Data:
                     cholesky_res[i] = tfp.math.fill_triangular_inverse(np.linalg.cholesky(np.cov(array[i:i+n_window], rowvar=False)))
                 array = cholesky_res
             elif approach =="batch_cython":
-                array = batched_cov(array,n_window, batch_size)[1]
+                array = batched_cov.batched_covariance_and_cholesky(array.astype(np.float64),int(n_window), int(batch_size))[1]
             else:
                 raise NotImplementedError(f"approach can only be fft, batch_fft or naive, but was {approach}")
             # Return result

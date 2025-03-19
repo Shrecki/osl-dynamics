@@ -31,27 +31,33 @@ def test_sliding_window_cov_naive():
     import time
     
     start = time.time()
-    for i in range(100):
+    for i in range(2):
         input_data = Data(orig_data,sampling_frequency=1.0,time_axis_first=True)
         
         # Naive preparation
         input_data.prepare({'moving_covar_cholesky_vectorized': {'n_window': 10, 'approach':'naive'}})
     end = time.time()
-    print((end-start)/100)
-    # "Optimized" preparation
+    print((end-start)/2)
     
 def test_sliding_window_cov_optim():
     n_c = 4
     n_s = [1000]
     
     orig_data = [np.random.randn(samples,n_c) for samples in n_s] 
-    import time
+    out = batched_cov.batched_covariance_and_cholesky(orig_data[0],10,1000)
+
+    input_data = Data(orig_data,sampling_frequency=1.0,time_axis_first=True)
+        
+    # Naive preparation
+    input_data.prepare({'moving_covar_cholesky_vectorized': {'n_window': 10, 'approach':'naive'}})
     
-    start = time.time()
-    for i in range(100):
-        out = batched_cov.batched_covariance_and_cholesky(orig_data[0],10,1000)
-    end = time.time()
-    print((end-start)/100)
+    
+    print(out[1].shape)
+    print(out[1][0])
+    print(np.linalg.cholesky(np.cov(orig_data[0][:10],rowvar=False)))
+    print(input_data.arrays[0][0])
+    #assert np.allclose(out[1], input_data.arrays[0], atol=1e-4)
+
     
 
 def test_sliding_window_incorrect_channels_spec():
@@ -115,7 +121,7 @@ def test_sliding_window_covar_correct():
         
         # Same for batched FFT    
         input_data = Data(orig_data,sampling_frequency=1.0,time_axis_first=True)
-        input_data.moving_covar_cholesky_vectorized(window,approach="batch_fft")
+        input_data.moving_covar_cholesky_vectorized(window,approach="batch_fft",batch_size=1000)
         
         for i in range(len(input_data.arrays)):
             assert np.allclose(input_data.arrays[i], expected_covars[i],atol=1e-4)
@@ -125,6 +131,9 @@ def test_sliding_window_covar_correct():
         
         for i in range(len(input_data.arrays)):
             assert np.allclose(input_data.arrays[i], expected_covars[i],atol=1e-4)
+            
+        input_data = Data(orig_data,sampling_frequency=1.0,time_axis_first=True)
+        input_data.moving_covar_cholesky_vectorized(window,approach="batch_cython", batch_size=1000)
             
 def test_different_sliding_windows_produce_different_covars():
     """
