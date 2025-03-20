@@ -296,6 +296,9 @@ def batched_covariance_and_cholesky(np.ndarray[DTYPE_t, ndim=2] x, int M, int B)
         
         # Use a slice (view) of x; no new allocation is made
         batch = x[i:batch_end]
+
+        if batch_end < M:
+            break
         
         # Compute covariances for this batch (directly vectorized)
         batch_cov_result = compute_cov_fft_vectorized(batch, M)
@@ -315,6 +318,7 @@ def batched_covariance_and_cholesky(np.ndarray[DTYPE_t, ndim=2] x, int M, int B)
             valid_start = O
             valid_end = L_batch - O
 
+        valid_end = max(valid_end, valid_start)
         num_valid = valid_end - valid_start
         if num_valid > 0:
             # Copy the valid covariance windows into the preallocated output
