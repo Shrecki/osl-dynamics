@@ -48,6 +48,10 @@ cdef np.ndarray[DTYPE_t, ndim=2] compute_cov_fft_vectorized(np.ndarray[DTYPE_t, 
     cdef int L_out = L - M + 1
     cdef int L_conv = L + M - 1  # length needed for full convolution
     cdef int vec_size = (N*(N+1))//2
+
+    if L_out <= 0:
+        # Return empty array with correct shape for 0 windows but proper column count
+        return np.empty((0, (N*(N+1))//2), dtype=np.float64)
     
     # Allocate output for vectorized covariance matrices
     cdef np.ndarray[DTYPE_t, ndim=2] covs_vec = np.empty((L_out, vec_size), dtype=np.float64)
@@ -216,7 +220,7 @@ def batched_covariance_noalloc(np.ndarray[DTYPE_t, ndim=2] x, int M, int B):
         batch = x[i:batch_end]
 
         # Skip this batch if it has fewer than M elements
-        if batch.shape[0] < M:
+        if batch_end - i < M:
             break
         
         # Compute covariances for this batch (directly vectorized)
@@ -297,7 +301,7 @@ def batched_covariance_and_cholesky(np.ndarray[DTYPE_t, ndim=2] x, int M, int B)
         # Use a slice (view) of x; no new allocation is made
         batch = x[i:batch_end]
 
-        if batch_end < M:
+        if batch_end - i < M:
             break
         
         # Compute covariances for this batch (directly vectorized)
