@@ -214,6 +214,10 @@ def batched_covariance_noalloc(np.ndarray[DTYPE_t, ndim=2] x, int M, int B):
         
         # Use a slice (view) of x; no new allocation is made
         batch = x[i:batch_end]
+
+        # Skip this batch if it has fewer than M elements
+        if batch.shape[0] < M:
+            break
         
         # Compute covariances for this batch (directly vectorized)
         batch_result = compute_cov_fft_vectorized(batch, M)
@@ -232,7 +236,7 @@ def batched_covariance_noalloc(np.ndarray[DTYPE_t, ndim=2] x, int M, int B):
         else:
             valid_start = O
             valid_end = L_batch - O
-
+        valid_end = max(valid_start,valid_end)
         num_valid = valid_end - valid_start
         if num_valid > 0:
             # Copy the valid windows into the preallocated output
