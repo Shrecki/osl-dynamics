@@ -281,64 +281,67 @@ def batched_covariance_and_cholesky(np.ndarray[DTYPE_t, ndim=2] x, int M, int B)
     cdef np.ndarray[DTYPE_t, ndim=2] covs_out = np.empty((L_total, vec_size), dtype=np.float64)
     cdef np.ndarray[DTYPE_t, ndim=2] chols_out = np.empty((L_total, N*(N+1)//2), dtype=np.float64)
 
-    # Overlap to ensure full windows are computed
+    # Overlap between batches to ensure continuous coverage
     cdef int O = M - 1
-    cdef int i = 0              # global start index for current batch
-    cdef int batch_end          # end index for current batch (not inclusive)
-    cdef int L_batch            # number of valid windows in current batch
-    cdef int valid_start, valid_end, num_valid
-    cdef int out_index = 0      # index into the final output array
-
-    cdef np.ndarray[DTYPE_t, ndim=2] batch, batch_cov_result
-    cdef np.ndarray[DTYPE_t, ndim=2] batch_chol_result
+    cdef int effective_batch_size = B - O  # The number of unique samples per batch after accounting for overlap
     
-    # Pre-allocate a full matrix buffer for conversions (reused across batches)
-    cdef np.ndarray[DTYPE_t, ndim=2] cov_matrix_buffer = np.empty((N, N), dtype=np.float64)
+    # Process data in batches, but ensure we generate outputs for every valid window
+    cdef int out_index = 0  # Position in the output arrays
+    
+    cdef int batch_start = 0  # Start index in the original array
+    cdef np.ndarray[DTYPE_t, ndim=2] batch, batch_cov_result, batch_chol_result
 
-    while i < T:
-        batch_end = min(i + B, T)
+    while batch_start < T - M + 1:  # Continue as long as we can form at least one valid window
+        # Calculate the end of this batch (limited by array size)
+        cdef int batch_end = min(batch_start + B, T)
         
-        # Use a slice (view) of x; no new allocation is made
-        batch = x[i:batch_end]
-
-        if batch_end - i < M:
+        # Skip this batch if it doesn't have enough elements for a full window
+        if batch_end - batch_start < M:
             break
+            
+        # Extract the current batch (view, not copy)
+        batch = x[batch_start:batch_end]
         
-        # Compute covariances for this batch (directly vectorized)
+        # Compute covariances for this batch
         batch_cov_result = compute_cov_fft_vectorized(batch, M)
-        L_batch = batch_cov_result.shape[0]
         
-        # Determine the valid windows to avoid boundary effects
-        if i == 0 and batch_end < T:
-            valid_start = 0
-            valid_end = L_batch - O
-        elif batch_end == T and i > 0:
+        # Number of valid windows in this batch
+        cdef int L_batch = batch_cov_result.shape[0]
+        
+        # Determine which outputs to keep from this batch
+        cdef int valid_start = 0
+        cdef int valid_end = L_batch
+        
+        # For all batches except the first, skip the first (M-1) windows
+        # as they overlap with the previous batch
+        if batch_start > 0:
             valid_start = O
-            valid_end = L_batch
-        elif i == 0 and batch_end == T:
-            valid_start = 0
-            valid_end = L_batch
-        else:
-            valid_start = O
-            valid_end = L_batch - O
-
-        valid_end = max(valid_end, valid_start)
-        num_valid = valid_end - valid_start
+        
+        # Ensure valid_start doesn't exceed valid_end
+        valid_start = min(valid_start, valid_end)
+        
+        # Calculate number of valid windows
+        cdef int num_valid = valid_end - valid_start
+        
         if num_valid > 0:
-            # Copy the valid covariance windows into the preallocated output
-            covs_out[out_index:out_index+num_valid] = batch_cov_result[valid_start:valid_end]
+            # Only process if there are valid windows
+            batch_valid_cov = batch_cov_result[valid_start:valid_end]
             
-            # Compute Cholesky decomposition for the valid windows
-            batch_chol_result = compute_cholesky(batch_cov_result[valid_start:valid_end], N)
+            # Compute Cholesky decomposition
+            batch_chol_result = compute_cholesky(batch_valid_cov, N)
             
-            # Copy the valid Cholesky factors into the preallocated output
+            # Copy results to output arrays
+            covs_out[out_index:out_index+num_valid] = batch_valid_cov
             chols_out[out_index:out_index+num_valid] = batch_chol_result
             
+            # Update output index
             out_index += num_valid
-            
-        # Advance the batch start by (B - O) to maintain the overlap
-        i += (B - O)
-
+        
+        # Move to next batch, advancing by effective_batch_size
+        batch_start += effective_batch_size
+    
+    # If we didn't fill the entire output arrays, trim them
     if out_index < L_total:
         return covs_out[:out_index], chols_out[:out_index]
+    
     return covs_out, chols_out
