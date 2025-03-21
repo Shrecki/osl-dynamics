@@ -281,6 +281,13 @@ def batched_covariance_and_cholesky(np.ndarray[DTYPE_t, ndim=2] x, int M, int B)
     cdef np.ndarray[DTYPE_t, ndim=2] covs_out = np.empty((L_total, vec_size), dtype=np.float64)
     cdef np.ndarray[DTYPE_t, ndim=2] chols_out = np.empty((L_total, N*(N+1)//2), dtype=np.float64)
 
+
+    cdef int batch_end
+    cdef int L_batch
+    cdef int valid_start
+    cdef int valid_end 
+    cdef int num_valid
+
     # Overlap between batches to ensure continuous coverage
     cdef int O = M - 1
     cdef int effective_batch_size = B - O  # The number of unique samples per batch after accounting for overlap
@@ -293,7 +300,7 @@ def batched_covariance_and_cholesky(np.ndarray[DTYPE_t, ndim=2] x, int M, int B)
 
     while batch_start < T - M + 1:  # Continue as long as we can form at least one valid window
         # Calculate the end of this batch (limited by array size)
-        cdef int batch_end = min(batch_start + B, T)
+        batch_end = min(batch_start + B, T)
         
         # Skip this batch if it doesn't have enough elements for a full window
         if batch_end - batch_start < M:
@@ -306,22 +313,22 @@ def batched_covariance_and_cholesky(np.ndarray[DTYPE_t, ndim=2] x, int M, int B)
         batch_cov_result = compute_cov_fft_vectorized(batch, M)
         
         # Number of valid windows in this batch
-        cdef int L_batch = batch_cov_result.shape[0]
+        L_batch = batch_cov_result.shape[0]
         
         # Determine which outputs to keep from this batch
-        cdef int valid_start = 0
-        cdef int valid_end = L_batch
+        valid_start = 0
+        valid_end = L_batch
         
         # For all batches except the first, skip the first (M-1) windows
         # as they overlap with the previous batch
-        if batch_start > 0:
-            valid_start = O
+        #if batch_start > 0:
+        #    valid_start = O
         
         # Ensure valid_start doesn't exceed valid_end
         valid_start = min(valid_start, valid_end)
         
         # Calculate number of valid windows
-        cdef int num_valid = valid_end - valid_start
+        num_valid = valid_end - valid_start
         
         if num_valid > 0:
             # Only process if there are valid windows

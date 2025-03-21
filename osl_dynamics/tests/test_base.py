@@ -134,6 +134,89 @@ def test_sliding_window_covar_correct():
             
         input_data = Data(orig_data,sampling_frequency=1.0,time_axis_first=True)
         input_data.moving_covar_cholesky_vectorized(window,approach="batch_cython", batch_size=1000)
+        
+def test_func_array_trim():
+    big_array = np.zeros((210570, 10))
+    
+    def fill_array(x, M,B):
+        T = x.shape[0]
+        N = x.shape[1]
+        L_total = T - M + 1
+        vec_size = (N*(N+1))//2
+
+        # Preallocate final output arrays
+        covs_out = np.zeros((L_total, vec_size), dtype=np.float64)
+        chols_out = np.zeros((L_total, N*(N+1)//2), dtype=np.float64)
+
+        # Overlap between batches to ensure continuous coverage
+        O = M - 1
+        effective_batch_size = B - O  # The number of unique samples per batch after accounting for overlap
+        
+        # Process data in batches, but ensure we generate outputs for every valid window
+        out_index = 0  # Position in the output arrays
+        
+        batch_start = 0  # Start index in the original array
+
+        while batch_start < T - M + 1:  # Continue as long as we can form at least one valid window
+            # Calculate the end of this batch (limited by array size)
+            batch_end = min(batch_start + B, T)
+            
+            # Skip this batch if it doesn't have enough elements for a full window
+            if batch_end - batch_start < M:
+                print("Skipped")
+                break
+                
+            # Extract the current batch (view, not copy)
+            print(f"Window considered goes from {batch_start} to  {batch_end}")
+            batch = x[batch_start:batch_end]
+            
+            print(f"batch shape: {batch.shape}")
+            
+            # Compute covariances for this batch
+            batch_cov_result = np.ones((batch.shape[0]-M+1,N*(N+1)//2)) #compute_cov_fft_vectorized(batch, M)
+            
+            print(f"batch cov res shape: {batch_cov_result.shape}")
+
+            # Number of valid windows in this batch
+            L_batch = batch_cov_result.shape[0]
+            
+            # Determine which outputs to keep from this batch
+            valid_start = 0
+            valid_end =  L_batch
+            print(f"valid start: {valid_start} valid_end: {valid_end}")
+            # Ensure valid_start doesn't exceed valid_end
+            valid_start = min(valid_start, valid_end)
+            
+            # Calculate number of valid windows
+            num_valid = valid_end - valid_start
+            
+            print(f"Number of valid entries: {num_valid}")
+            if num_valid > 0:
+                # Only process if there are valid windows
+                batch_valid_cov = batch_cov_result[valid_start:valid_end]
+                
+                # Compute Cholesky decomposition
+                batch_chol_result = batch_valid_cov#compute_cholesky(batch_valid_cov, N)
+                
+                # Copy results to output arrays
+                covs_out[out_index:out_index+num_valid] = batch_valid_cov
+                chols_out[out_index:out_index+num_valid] += batch_chol_result
+                
+                # Update output index
+                out_index += num_valid
+            
+            # Move to next batch, advancing by effective_batch_size
+            batch_start += effective_batch_size
+        
+        # If we didn't fill the entire output arrays, trim them
+        if out_index < L_total:
+            return covs_out[:out_index], chols_out[:out_index]
+        else:
+            return covs_out, chols_out
+        
+    res = fill_array(big_array, 5000, 10000)
+    assert res[1].shape[0] == big_array.shape[0]-5000+1
+    print(np.unique(res[1]))
             
 def test_different_sliding_windows_produce_different_covars():
     """
