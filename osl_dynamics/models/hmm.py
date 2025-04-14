@@ -696,8 +696,11 @@ class Model(ModelBase):
         # Convert input data to log space
         log_P = np.log(P + EPS)
         
+        print(f"Input shapes: {log_P.shape}, {log_B.shape}, {log_Pi_0.shape}")
+        
         # Use the C++ forward-backward implementation
         log_prob, fwdlattice = _hmmc.forward_log(log_Pi_0, log_P, log_B)
+        print(f"fwdlattice shape: {fwdlattice.shape}")
         bwdlattice = _hmmc.backward_log(log_Pi_0, log_P, log_B)
         
         # Calculate gamma (state probabilities)
