@@ -276,6 +276,61 @@ def set_covariances_regularizer(
         learnable_tensor_layer.regularizer = regularizers.InverseWishart(
             nu, psi, epsilon
         )
+        
+
+
+def set_covariances_wishart_regularizer(
+    model,
+    training_dataset,
+    epsilon,
+    diagonal=False,
+    layer_name="covs",
+):
+    """Set the covariances regularizer based on training data.
+
+    If config.diagonal_covariances is True, a log-normal prior is applied to
+    the diagonal of the covariance matrices with :code:`mu=0`,
+    :code:`sigma=sqrt(log(2*range))`. Otherwise, an inverse Wishart prior is
+    applied to the covariance matrices with :code:`nu=n_channels-1+0.1`,
+    :code:`psi=diag(1/range)`.x
+
+    Parameters
+    ----------
+    model : osl_dynamics.models.*.Model.model
+        The model.
+    training_dataset : osl_dynamics.data.Data
+        The training dataset.
+    epsilon : float
+        Error added to the covariance matrices.
+    diagonal : bool, optional
+        Whether the covariances are diagonal.
+    layer_name : str, optional
+        Layer name of the covariances. Can be :code:`"covs"` or
+        :code:`"group_covs"`.
+    """
+    n_channels = dtf.get_n_channels(training_dataset)
+
+    tfb = tfp.bijectors
+    dataset = dtf._validate_tf_dataset(training_dataset)
+    
+    bijector = tfb.Chain(
+            [tfb.CholeskyOuterProduct(), tfb.CorrelationCholesky()]
+        )
+    mean = []
+    for batch in dataset:
+        if isinstance(batch, dict):
+            batch = batch["data"]
+        batch = tf.mean(bijector(batch),axis=(0,1))
+        batch = batch.numpy()
+        mean.append(batch)
+        
+    covs_layer = model.get_layer(layer_name)
+    nu = n_channels - 1 + 0.1
+    psi = np.array(mean).mean(axis=0)
+    learnable_tensor_layer = covs_layer.layers[0]
+    learnable_tensor_layer.regularizer = regularizers.InverseWishart(
+        nu, psi, epsilon
+    )
 
 
 def set_stds_regularizer(model, training_dataset, epsilon):

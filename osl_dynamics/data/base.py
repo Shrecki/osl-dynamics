@@ -168,6 +168,8 @@ class Data:
         # Extra session labels
         if session_labels is None:
             self.session_labels = []
+            
+        self.n_orig_channels = None  # Will store the original value
 
     def __iter__(self):
         return iter(self.arrays)
@@ -193,7 +195,10 @@ class Data:
     @property
     def n_channels(self):
         """Number of channels in the data files."""
-        return self.arrays[0].shape[-1]
+        if self.n_orig_channels is not None:
+            return self.n_orig_channels
+        else:
+            return self.arrays[0].shape[-1]
 
     @property
     def n_samples(self):
@@ -994,6 +999,8 @@ class Data:
             raise ValueError("n_window should be at least the number of channels for covariances to be defined.")
         
         self.n_window = n_window
+        
+        self.n_orig_channels = self.n_channels
 
         # What data should we use?
         arrays = self.raw_data_arrays if use_raw else self.arrays
@@ -1160,6 +1167,93 @@ class Data:
                 array = cholesky_res
             elif approach =="batch_cython":
                 array = batched_cov.batched_covariance_and_cholesky(array.astype(np.float64),int(n_window), int(batch_size))[1]
+                n_samples,n_vars = array.shape
+                # Reorder from "numpy-style" vectorization order to tensorflow-style vectorization order
+                def get_tril_to_tfp_indices(n_channels):
+                    """
+                    Create a direct mapping of indices from np.tril_indices ordering to 
+                    TensorFlow Probability's FillTriangular ordering.
+                    
+                    Parameters
+                    ----------
+                    n_channels : int
+                        Number of channels/dimension of the square matrix.
+                    
+                    Returns
+                    -------
+                    numpy.ndarray
+                        Array of indices that can be used to reorder vectors from 
+                        np.tril_indices ordering to TFP's FillTriangular ordering.
+                    """
+                    import tensorflow as tf
+                    vec_size = n_channels * (n_channels + 1) // 2
+                    #print(test_seq)
+                    # Create TFP ordering
+                    fill_triangular = tfp.bijectors.FillTriangular()
+                    test_vector = np.arange(vec_size, dtype=int)
+                    test_matrix = fill_triangular(tf.convert_to_tensor([test_vector])).numpy()[0]
+                    
+                    #print(test_matrix)
+                    
+                    ids_remap = np.zeros(vec_size,dtype=int)
+                    for j in range(n_channels):
+                        for k in range(j+1):
+                            ids_remap[j*(j+1)//2 + k] = test_matrix[j, k]
+                    #print(ids_remap)
+                    
+                    return np.argsort(ids_remap)
+                def reorder_tril_to_tfp_direct(cholesky_vectors, transpose_needed=False, n_channels=None, mapping=None):
+                    """
+                    Reorder vectorized Cholesky factors from np.tril_indices ordering 
+                    to TensorFlow Probability's FillTriangular ordering using direct indexing.
+                    
+                    Parameters
+                    ----------
+                    cholesky_vectors : numpy.ndarray
+                        Vectorized Cholesky factors using np.tril_indices ordering.
+                        Shape is (vec_size, T) where vec_size = n_channels*(n_channels+1)/2
+                        and T is the number of time points. Can also accept shape (T, vec_size).
+                    
+                    n_channels : int, optional
+                        Number of channels/dimension of the square matrix. 
+                        Required if mapping is not provided.
+                    
+                    mapping : numpy.ndarray, optional
+                        Precomputed index mapping from get_tril_to_tfp_indices(). 
+                        If not provided, it will be computed using n_channels.
+                    
+                    Returns
+                    -------
+                    numpy.ndarray
+                        Reordered vectorized Cholesky factors in TFP's FillTriangular ordering.
+                        Shape matches the input shape.
+                    """
+                    # Check if we need to transpose
+                    if cholesky_vectors.ndim == 2 and transpose_needed:
+                        cholesky_vectors = cholesky_vectors.T
+                        
+                    # Get mapping if not provided
+                    if mapping is None:
+                        if n_channels is None:
+                            raise ValueError("Either mapping or n_channels must be provided")
+                        mapping = get_tril_to_tfp_indices(n_channels)
+                    
+                    # Apply the mapping to reorder the vectors
+                    if cholesky_vectors.ndim == 1:
+                        # Single vector
+                        reordered = cholesky_vectors[mapping]
+                    else:
+                        # Multiple vectors
+                        reordered = cholesky_vectors[mapping, :]
+                    
+                    # Transpose back if needed
+                    if transpose_needed:
+                        reordered = reordered.T
+                    
+                    return reordered
+                mapping = get_tril_to_tfp_indices(self.n_channels)
+                array = reorder_tril_to_tfp_direct(array,transpose_needed=True,n_channels=self.n_channels, mapping=mapping)
+                
             else:
                 raise NotImplementedError(f"approach can only be fft, batch_fft or naive, but was {approach}")
             # Return result
@@ -1170,7 +1264,8 @@ class Data:
         for i in tqdm(range(len(arrays)), desc="Sliding window covariance"):
             array = arrays[i]
             self.arrays[i] = _apply(array,self.prepared_data_filenames)
-        
+            #print(f"N channels after apply: {self.n_channels}")
+
         self.n_covar_channels = self.arrays[0].shape[1]
         
         

@@ -44,13 +44,22 @@ def test_sliding_window_cov_optim():
     n_s = [1000]
     
     orig_data = [np.random.randn(samples,n_c) for samples in n_s] 
+    import time
+    start = time.time()
+
     out = batched_cov.batched_covariance_and_cholesky(orig_data[0],10,1000)
+    end = time.time()
+    
+    print(f"Opti: {end-start}")
 
     input_data = Data(orig_data,sampling_frequency=1.0,time_axis_first=True)
         
     # Naive preparation
+    start = time.time()
     input_data.prepare({'moving_covar_cholesky_vectorized': {'n_window': 10, 'approach':'naive'}})
-    
+    end = time.time()
+    print(f"Naive: {end-start}")
+
     
     print(out[1].shape)
     print(out[1][0])
@@ -134,6 +143,13 @@ def test_sliding_window_covar_correct():
             
         input_data = Data(orig_data,sampling_frequency=1.0,time_axis_first=True)
         input_data.moving_covar_cholesky_vectorized(window,approach="batch_cython", batch_size=1000)
+        
+
+        #print(input_data.arrays[0])
+        #print(expected_covars[0])
+        for i in range(len(input_data.arrays)):
+            assert np.allclose(input_data.arrays[i], expected_covars[i],atol=1e-4)
+        
         
 def test_func_array_trim():
     big_array = np.zeros((210570, 10))

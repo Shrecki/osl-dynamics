@@ -136,6 +136,26 @@ def test_hmm_wishart_synthetic_dataset():
     and feed it to the model.    
     """
     
+    data = Data([np.random.randn(50000,10)],sampling_frequency=1.0)
+    config = Config(
+        n_states=3,
+        n_channels=10,
+        sequence_length=1000,
+        batch_size=30,
+        learning_rate=0.01,
+        n_epochs=1000,
+        learn_covariances=True,
+        compute_cov_runtime=True,
+        multi_gpu = False,
+        window_size = 90
+    )
+    
+    model = Model(config)
+    print(model.summary())
+    
+    model.fit(data)
+    
+    
     # Generate a list of random state changes.
     # We start from a purely ordered list and slightly perturb it.
     # Expectation: window size will remove instantaneous observations,

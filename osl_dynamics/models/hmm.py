@@ -49,6 +49,9 @@ from osl_dynamics.utils.misc import set_logging_level
 from osl_dynamics import array_ops
 from osl_dynamics.data import Data
 
+
+from . import _hmmc
+
 _logger = logging.getLogger("osl-dynamics")
 
 warnings.filterwarnings("ignore", category=NumbaWarning)
@@ -155,10 +158,9 @@ class Config(BaseModelConfig):
     # Transition model parameters
     kappa: float = 0.0
     
-    # Use masking or not
-    use_mask: bool = False
-    semi_supervised:bool = False
-
+    # Use log space or not
+    implementation: str = "log"
+    
     def __post_init__(self):
         self.validate_observation_model_parameters()
         self.validate_trans_prob_parameters()
@@ -208,14 +210,9 @@ class Model(ModelBase):
         self.set_trans_prob(self.config.initial_trans_prob)
         self.set_state_probs_t0(self.config.state_probs_t0)
 
-    def _check_valid(self, ll_masks, forced_states):
-        if not self.config.use_mask:
-            if ll_masks is not None:
-                raise ValueError("Cannot use ll_masks in this config. Set use_mask=True in your config.")
-        if not self.config.semi_supervised:
-            if forced_states is not None:
-                raise ValueError("Cannot use forced_states in this config. Set semi_supervised=True in your config.")
-        
+    def _check_valid(self):
+        pass
+    
     def _get_npoints(self,dataset):
         points = []
         if isinstance(dataset, list):
@@ -237,8 +234,7 @@ class Model(ModelBase):
         return points
             
             
-    def _make_combined_op(self,dataset_elem, ll_masks_elem, forced_states_elem, step_size, concatenate):
-        self._check_valid(ll_masks_elem,forced_states_elem)
+    def _make_combined_op(self,dataset_elem, step_size, concatenate):
         assert not isinstance(dataset_elem,list)
         n_points = 0
         for batch in dataset_elem.as_numpy_iterator():
@@ -247,127 +243,18 @@ class Model(ModelBase):
             n_points += b * seq
         
         data_tuple = (dataset_elem,)
-            
-        if self.config.use_mask:
-            #if ll_masks_elem is None:
-            #    ll_masks_elem = np.ones(n_points, dtype=bool)
-            #ll_masks_elem = self.make_dataset(ll_masks_elem, shuffle=False, concatenate=concatenate, step_size=step_size)
-            data_tuple = data_tuple + (ll_masks_elem,)
-            
-        if self.config.semi_supervised:
-            #if forced_states_elem is None:
-            #    forced_states_elem = np.ones(n_points,dtype=int)*(-1)
-            #forced_states_elem = self.make_dataset(forced_states_elem, shuffle=False, concatenate=concatenate, step_size=step_size)
-            data_tuple = data_tuple + (forced_states_elem,)
-        
-        if len(data_tuple) > 1:
-            # Fuse as a single dataset
-            dataset_elem = tf.data.Dataset.zip(data_tuple)
         return dataset_elem
         
-    def _make_combined_list(self, dataset_list, ll_masks_list, forced_states_list, step_size, concatenate):
+    def _make_combined_list(self, dataset_list , step_size, concatenate):
         data = []
         for i, e in enumerate(dataset_list):
             assert not isinstance(e,list)
-            assert not isinstance(ll_masks_list[i],list)
-            data.append(self._make_combined_op(dataset_list[i], ll_masks_list[i], forced_states_list[i], step_size,concatenate))
+            data.append(self._make_combined_op(dataset_list[i], step_size,concatenate))
         return data
     
     def cast_to_type(x, dtype):
         x['data'] = tf.cast(x["data"], dtype)
         return x
-    
-    def _make_combined_dataset(self,dataset, ll_masks, forced_states, sampling_frequency, step_size=None, concatenate=True):
-        """Utility function used to zip together data with likelihood masks and supervised state sequences.
-           Masks are only created and zipped through if their respective flag is enabled in the Config.
-        
-        Parameters
-        ----------
-        dataset : tf.data.Dataset or osl_dynamics.data.Data
-                  Training dataset.
-        ll_masks: np.ndarray or None
-                  Likelihood mask. Any timepoint not in the mask will be treated as missing data and marginalized over
-                  in likelihood (likelihood set to 1).
-                  Used only if :code:`self.config.use_mask=True`. If None, a trivial mask will be created, including all
-                  timepoints.
-        forced_states: np.ndarray or None
-                  Supervised state assignment. If forced_states[t] > 0, the posterior state at time t will be constrained to be force_states[t].
-                  Otherwise, the state posterior is obtained by Baum Welch normally.
-                  Used only if :code:`self.config.use_mask=True`. If None, a trivial state sequence of -1 will be created.
-        
-        Returns
-        -------
-        
-        dataset: tf.data.Dataset
-                 Training dataset, potentially zipped with none of the masks, one of them or both of them depending on the flags
-                 in Config.
-        """
-        
-        """
-        self._check_valid(ll_masks_elem,forced_states_elem)
-        n_points = 0
-        for batch in dataset_elem.as_numpy_iterator():
-            # Assume each batch is a dictionary with key "data"
-            b, seq, _ = batch["data"].shape
-            n_points += b * seq
-        
-        #print(f"N_points: {n_points}")
-        data_tuple = (dataset_elem,)
-            
-        if self.config.use_mask:
-            if ll_masks_elem is None:
-                ll_masks_elem = np.ones(n_points, dtype=bool)
-            ll_masks_elem = self.make_dataset(ll_masks_elem, shuffle=False, concatenate=concatenate, step_size=step_size)
-            data_tuple = data_tuple + (ll_masks_elem,)
-            
-        if self.config.semi_supervised:
-            if forced_states_elem is None:
-                forced_states_elem = np.ones(n_points,dtype=int)*(-1)
-            forced_states_elem = self.make_dataset(forced_states_elem, shuffle=False, concatenate=concatenate, step_size=step_size)
-            data_tuple = data_tuple + (forced_states_elem,)
-        
-        if len(data_tuple) > 1:
-            # Fuse as a single dataset
-            dataset_elem = tf.data.Dataset.zip(data_tuple)
-        return dataset_elem
-        """
-        self._check_valid(ll_masks,forced_states)
-        
-        n_points_list = self._get_npoints(dataset)
-        if self.config.use_mask:
-            # Create trivial mask
-            if ll_masks is None:
-                ll_masks = Data([np.ones(n_points, dtype=bool) for n_points in n_points_list], time_axis_first=True, sampling_frequency=sampling_frequency)
-                #ll_masks.arrays = [x.astype(np.uint8) for x in ll_masks.arrays]
-            ll_masks = self.make_dataset(ll_masks, shuffle=False, concatenate=concatenate, step_size=step_size)
-        else:
-            if isinstance(dataset,list):
-                ll_masks = [None]*len(dataset)
-            
-        if self.config.semi_supervised:
-            # Create trivial forced state
-            if forced_states is None:
-                forced_states = [np.ones(n_points,dtype=int)*(-1) for n_points in n_points_list]
-                forced_states = Data(forced_states, time_axis_first=True, sampling_frequency=sampling_frequency)
-                #forced_states.arrays = [x.astype(np.int32) for x in forced_states.arrays]
-            forced_states = self.make_dataset(forced_states, shuffle=False, concatenate=concatenate, step_size=step_size)
-        else:
-            if isinstance(dataset,list):
-                forced_states = [None]*len(dataset)
-            
-        if isinstance(dataset, list):
-            # Create here the masks, per sublist element
-            # @ TODO: the list approach is good BUT:
-            # we should really not do it this way, turns out
-            # we should construct our datasets direcly here
-            # and THEN, if list, we concatenate tuples by each element
-            # As a consequence, we need to consider the case of the list and the "no list"
-            # as one: turn the "no-list" as a one-element list to maintain the code simple.
-            
-            # Method handles looping
-            return self._make_combined_list(dataset, ll_masks, forced_states, step_size, concatenate)
-        else:
-            return self._make_combined_list([dataset], [ll_masks], [forced_states], step_size, concatenate)[0]
     
     def _unpack_inputs(self, element):
         """
@@ -380,36 +267,9 @@ class Model(ModelBase):
         Returns
         -------
         data: data in the batch
-        ll_mask: likelihood mask if self.config.use_mask is true, else None
-        forced_states: forced_states if self.config.semi_supervised is true, else None
         """
-        if isinstance(element, (list, tuple)):
-            if len(element) == 2:
-                if self.config.use_mask:
-                    data, ll_masks = element
-                    forced_states = None
-                    ll_masks = ll_masks["data"]  
-                elif self.config.semi_supervised:
-                    data, forced_states = element
-                    ll_masks = None
-                    forced_states = forced_states["data"] 
-                else:
-                    raise ValueError("Dataset element is a tuple of data, which is not supported by this model."\
-                                        "If you passed some ll_masks, set use_mask=True in the Config object."\
-                                        " If you passed some forced_states, set semi_supervised=True in the Config object.")
-            elif len(element) == 3:
-                if self.config.use_mask and self.config.semi_supervised:
-                    data, ll_masks, forced_states = element
-                    forced_states = forced_states["data"]
-                    ll_masks = ll_masks["data"]
-                else:
-                    raise ValueError("Dataset element is a thruple, which is not supported by this model."\
-                        "If you passed ll_masks and forced_states, set semi_supervised=True and use_mask=True in the Config object.")
-        else:
-            data, ll_masks, forced_states = element, None, None
-        
-        x = data["data"]
-        return x, ll_masks, forced_states
+        x = element["data"]
+        return x
         
     def fit(
         self,
@@ -419,8 +279,6 @@ class Model(ModelBase):
         checkpoint_freq=None,
         save_filepath=None,
         dfo_tol=None,
-        ll_masks = None,
-        forced_states = None,
         verbose=1,
         **kwargs,
     ):
@@ -448,18 +306,6 @@ class Model(ModelBase):
             When the maximum fractional occupancy change (from epoch to epoch)
             is less than this value, we stop the training. If :code:`None`
             there is no early stopping.
-        ll_masks: np.ndarray of bools, optional (default is None)
-            Mask of points to consider in computation of log likelihood.
-            Points ignored will have LL set to 0, such that they do not contribute
-            (equivalent to marginalizing them out). If :code:`None`, all points
-            are included. To use this option, make sure that you set :code:`use_mask=True`
-            when setting up your model Config.
-        forced_states: np.ndarray of ints, option (default is None)
-            Points where states are known. If states are passed in this way,
-            posterior probabilities are hard set to 1 in relevant time windows.
-            If :code:`None`, states are free to evolve. 
-            To use this option, make sure that you set :code:`semi_supervised=True` when 
-            setting up your model Config.
         verbose : int, optional
             Verbosity level. :code:`0=silent`.
         kwargs : keyword arguments, optional
@@ -472,7 +318,6 @@ class Model(ModelBase):
             Dictionary with history of the loss, learning rates (:code:`lr`
             and :code:`rho`) and fractional occupancies during training.
         """
-        self._check_valid(ll_masks,forced_states)
         if epochs is None:
             epochs = self.config.n_epochs
 
@@ -499,7 +344,6 @@ class Model(ModelBase):
         # Set static loss scaling factor (Sets bash size in model)
         self.set_static_loss_scaling_factor(dataset)
         
-        dataset = self._make_combined_dataset(dataset, ll_masks, forced_states,sfreq,step_size=None, concatenate=True)
         
         # Training curves
         history = {"loss": [], "rho": [], "lr": [], "fo": [], "max_dfo": []}
@@ -528,9 +372,9 @@ class Model(ModelBase):
             loss = []
             occupancies = []
             for element in dataset:
-                x, ll_masks, forced_states = self._unpack_inputs(element)
+                x = self._unpack_inputs(element)
                 # Update state probabilities
-                gamma, xi = self.get_posterior(x,ll_masks=ll_masks,forced_states=forced_states)
+                gamma, xi = self.get_posterior(x)
 
                 # Update transition probability matrix
                 if self.config.learn_trans_prob:
@@ -547,17 +391,8 @@ class Model(ModelBase):
                 # Update observation model
                 x_and_gamma = np.concatenate([x, gamma], axis=2)
                 h = None
-                if not self.config.use_mask and not self.config.semi_supervised: 
-                    h = self.model.fit(x_and_gamma, epochs=1, verbose=0, **kwargs)
-                else:
-                    if self.config.use_mask:
-                        if self.config.semi_supervised:
-                            h = self.model.fit([x_and_gamma, ll_masks, forced_states], epochs=1, verbose=0, **kwargs)
-                        else:
-                            h = self.model.fit([x_and_gamma, ll_masks], epochs=1, verbose=0, **kwargs)
-                    else:
-                        h = self.model.fit([x_and_gamma, forced_states], epochs=1, verbose=0, **kwargs)
-
+                h = self.model.fit(x_and_gamma, epochs=1, verbose=0, **kwargs)
+                
                 # Get new loss
                 l = h.history["loss"][0]
                 if np.isnan(l):
@@ -813,23 +648,13 @@ class Model(ModelBase):
             xi[forced_idx, positions.astype(int)] = 1.0
         return xi
         
-    def get_posterior(self, x, ll_masks=None, forced_states=None):
+    def get_posterior(self, x):
         """Get marginal and joint posterior.
 
         Parameters
         ----------
         x : np.ndarray
             Observed data. Shape is (batch_size, sequence_length, n_channels).
-        ll_masks: np.ndarray of bools,optional
-            Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
-            Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
-            If None, all points are considered
-        forced_states: np.ndarray of ints, optional
-            Array of known state timecourses. Shape is (batch_size, sequence_length).
-            Every entry is either -1 (no known state for this point) or the state number
-            (between 0 and n_states). 
-            The posteriors will be corrected to be hard assigned for the provided points
-            to the provided states after Baum Welch computation.
 
         Returns
         -------
@@ -841,19 +666,48 @@ class Model(ModelBase):
             time points, :math:`q(s_t, s_{t+1})`. Shape is
             (batch_size*sequence_length-1, n_states*n_states).
         """
-        if ll_masks is None:
-            B = self.get_likelihood(x)
-        else:
-            B = self.get_likelihood(x, ll_masks=ll_masks)
-        Pi_0 = self.state_probs_t0
         P = self.trans_prob
-        gamma, xi = self.baum_welch(B, Pi_0, P)
-        
-        # Adjust gamma and xi according to forced state sequence
-        # (Not work done if forced_states is None)
-        gamma = self.override_gamma(gamma, forced_states)
-        xi = self.override_xi(xi, forced_states)
+
+        if self.config.implementation == "log":
+            log_B = self.get_log_likelihood(x)
+            log_Pi_0 = np.log(self.state_probs_t0 + EPS)
+            gamma, xi = self.baum_welch_log(log_B, log_Pi_0, P)
+        else:
+            B = self.get_likelihood(x)
+            
+            Pi_0 = self.state_probs_t0
+            gamma, xi = self.baum_welch(B, Pi_0, P)
         return gamma,xi
+    
+    def log_normalize(self,a, axis=None):
+        """Normalize probabilities in log-space."""
+        a_lse = logsumexp(a, axis=axis, keepdims=True)
+        a -= a_lse
+        return a
+    
+    @numba.jit
+    def baum_welch_log(self, log_B, log_Pi_0, P):
+        """Hidden state inference using the Baum-Welch algorithm with C++ optimizations.
+        
+        Uses the _hmmc.cpp implementation for faster log-space calculations.
+        """
+        # Convert input data to log space
+        log_P = np.log(P + EPS)
+        
+        # Use the C++ forward-backward implementation
+        log_prob, fwdlattice = _hmmc.forward_log(log_Pi_0, log_P, log_B)
+        bwdlattice = _hmmc.backward_log(log_Pi_0, log_P, log_B)
+        
+        # Calculate gamma (state probabilities)
+        log_gamma = fwdlattice + bwdlattice
+        self.log_normalize(log_gamma, axis=1)
+        gamma = np.exp(log_gamma)
+        
+        # Calculate xi (transition probabilities)
+        log_xi = _hmmc.compute_log_xi_sum(fwdlattice, P, bwdlattice, log_B)
+        xi = np.exp(log_xi.reshape(log_B.shape[1]-1, -1))
+        
+        return gamma, xi
 
     @numba.jit
     def baum_welch(self, B, Pi_0, P):
@@ -914,17 +768,13 @@ class Model(ModelBase):
 
         return gamma, xi
 
-    def get_likelihood(self, x, ll_masks = None):
+    def get_likelihood(self, x):
         """Get the likelihood, :math:`p(x_t | s_t)`.
 
         Parameters
         ----------
         x : np.ndarray
             Observed data. Shape is (batch_size, sequence_length, n_channels).
-        ll_masks: np.ndarray of bools,optional
-            Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
-            Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
-            If None, all points are considered
 
         Returns
         -------
@@ -951,11 +801,6 @@ class Model(ModelBase):
                 )
             )
             log_likelihood[state] = mvn.log_prob(x)
-            if ll_masks is not None:
-                _logger.debug(f"Mask shape {ll_masks.shape}, data shape {log_likelihood[state].shape} use_mask {self.config.use_mask}")
-                #print(ll_masks.shape)
-                #print(log_likelihood[state].shape)
-                log_likelihood[state] = log_likelihood[state] * tf.squeeze(ll_masks)#[:,:,0]
         log_likelihood = log_likelihood.reshape(n_states, batch_size * sequence_length)
         
 
@@ -999,7 +844,7 @@ class Model(ModelBase):
         sticky_counts = np.eye(self.config.n_states)
         phi_interim = (np.sum(xi, axis=0).reshape(
             self.config.n_states, self.config.n_states
-        ).T)/ (np.sum(gamma[:-1], axis=0).reshape(self.config.n_states, 1))
+        ).T + EPS)/ (np.sum(gamma[:-1], axis=0).reshape(self.config.n_states, 1) + self.config.n_states*EPS)
 
         # We use stochastic updates on trans_prob as per Eqs. (1) and (2) in the
         # paper:
@@ -1421,7 +1266,7 @@ class Model(ModelBase):
                 self.config.diagonal_covariances,
             )
 
-    def free_energy(self, dataset,ll_masks=None):
+    def free_energy(self, dataset):
         """Get the variational free energy.
 
         This calculates:
@@ -1435,10 +1280,6 @@ class Model(ModelBase):
         ----------
         dataset : tf.data.Dataset or osl_dynamics.data.Data
             Dataset to evaluate the free energy for.
-        ll_masks: np.ndarray of bools,optional
-            Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
-            Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
-            If None, all points are considered
 
         Returns
         -------
@@ -1457,7 +1298,7 @@ class Model(ModelBase):
             batch_size = x.shape[0]
 
             # Get the marginal and join posterior to calculate the free energy
-            gamma, xi = self.get_posterior(x,ll_masks=ll_masks)
+            gamma, xi = self.get_posterior(x)
 
             # Calculate the free energy:
             #
@@ -1602,7 +1443,7 @@ class Model(ModelBase):
 
         return evidence
 
-    def get_alpha(self, dataset, concatenate=False, remove_edge_effects=False, ll_masks=None, forced_states=None):
+    def get_alpha(self, dataset, concatenate=False, remove_edge_effects=False):
         """Get state probabilities.
 
         Parameters
@@ -1624,10 +1465,6 @@ class Model(ModelBase):
         alpha : list or np.ndarray
             State probabilities with shape (n_sessions, n_samples, n_states)
             or (n_samples, n_states).
-        ll_masks: np.ndarray of bools,optional
-            Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
-            Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
-            If None, all points are considered
         """
         if remove_edge_effects:
             step_size = self.config.sequence_length // 2  # 50% overlap
@@ -1637,7 +1474,6 @@ class Model(ModelBase):
 
         sampling_freq = dataset.sampling_frequency
         dataset = self.make_dataset(dataset, step_size=step_size)
-        dataset = self._make_combined_dataset(dataset, ll_masks, forced_states, sampling_freq, step_size=step_size,concatenate=False)
 
         n_datasets = len(dataset)
         if len(dataset) > 1:
@@ -1654,10 +1490,10 @@ class Model(ModelBase):
             for data in dataset[i]:
                 n_batches = dtf.get_n_batches(dataset[i])
                 
-                x, ll_masks, forced_states = self._unpack_inputs(data)
+                x  = self._unpack_inputs(data)
 
                 #x = data["data"]
-                g, _ = self.get_posterior(x,ll_masks=ll_masks, forced_states=forced_states)
+                g, _ = self.get_posterior(x)
                 if remove_edge_effects:
                     batch_size, sequence_length, _ = x.shape
                     n_states = g.shape[-1]
@@ -1822,7 +1658,6 @@ class Model(ModelBase):
         learning_rate=None,
         dfo_tol=None,
         store_dir="tmp",
-        ll_masks=None
     ):
         """Fine tuning the model for each session.
 
@@ -1846,10 +1681,6 @@ class Model(ModelBase):
             there is no early stopping.
         store_dir : str, optional
             Directory to temporarily store the model in.
-        ll_masks: np.ndarray of bools,optional
-            Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
-            Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
-            If None, all points are considered
 
         Returns
         -------
@@ -1886,7 +1717,7 @@ class Model(ModelBase):
                 # Train on this session
                 with training_data.set_keep(i):
                     self.fit(training_data, dfo_tol=dfo_tol, verbose=0)
-                    a = self.get_alpha(training_data, concatenate=True,ll_masks=ll_masks)
+                    a = self.get_alpha(training_data, concatenate=True)
 
                 # Get the inferred parameters
                 m, c = self.get_means_covariances()
@@ -1905,7 +1736,7 @@ class Model(ModelBase):
 
         return alpha, np.array(means), np.array(covariances)
 
-    def dual_estimation(self, training_data, alpha=None, n_jobs=1, ll_masks=None):
+    def dual_estimation(self, training_data, alpha=None, n_jobs=1):
         """Dual estimation to get session-specific observation model parameters.
 
         Here, we estimate the state means and covariances for sessions
@@ -1920,10 +1751,6 @@ class Model(ModelBase):
             (n_sessions, n_samples, n_states).
         n_jobs : int, optional
             Number of jobs to run in parallel.
-        ll_masks: np.ndarray of bools,optional
-            Likelihood mask of points to consider. Shape is (batch_size, sequence_length).
-            Every entry with a 0 will be ignored, resulting in a LL of 0 (likelihood of 1).
-            If None, all points are considered
 
         Returns
         -------
@@ -1935,7 +1762,7 @@ class Model(ModelBase):
         """
         if alpha is None:
             # Get the posterior
-            alpha = self.get_alpha(training_data, concatenate=False, ll_masks=ll_masks)
+            alpha = self.get_alpha(training_data, concatenate=False)
 
         if isinstance(alpha, np.ndarray):
             alpha = [alpha]
@@ -2148,42 +1975,14 @@ class Model(ModelBase):
         ll_loss_layer = None
         ll_loss = None
         model = None
-        if config.use_mask:
-            ll_loss_layer = CategoricalLogLikelihoodLossLayerMasked(
-                config.n_states,
-                config.covariances_epsilon,
-                config.loss_calc,
-                name="ll_loss",
-            )
-            
-            mask_input = layers.Input(
-                shape=(config.sequence_length, 1),
-                name="mask",
-            )
-            ll_loss = ll_loss_layer([data, mu, D, gamma, None, mask_input])
-            
-            if config.semi_supervised:
-                state_seq_input = layers.Input(
-                    shape=(config.sequence_length, 1),
-                    name="state_labels",
-                ) 
-                model = tf.keras.Model(inputs=[inputs, mask_input, state_seq_input], outputs=[ll_loss], name="HMM")
-            else:
-                model = tf.keras.Model(inputs=[inputs, mask_input], outputs=[ll_loss], name="HMM")
-        else:
-            ll_loss_layer = CategoricalLogLikelihoodLossLayer(
-                config.n_states,
-                config.covariances_epsilon,
-                config.loss_calc,
-                name="ll_loss",
-            )
-            ll_loss = ll_loss_layer([data, mu, D, gamma, None])
-            if config.semi_supervised:
-                state_seq_input = layers.Input(
-                    shape=(config.sequence_length, 1),
-                    name="state_labels",
-                ) 
-                model = tf.keras.Model(inputs=[inputs, state_seq_input], outputs=[ll_loss], name="HMM")
-            else:
-                model = tf.keras.Model(inputs=inputs, outputs=[ll_loss], name="HMM")
+        
+        ll_loss_layer = CategoricalLogLikelihoodLossLayer(
+            config.n_states,
+            config.covariances_epsilon,
+            config.loss_calc,
+            name="ll_loss",
+        )
+        ll_loss = ll_loss_layer([data, mu, D, gamma, None])
+        
+        model = tf.keras.Model(inputs=inputs, outputs=[ll_loss], name="HMM")
         return model
