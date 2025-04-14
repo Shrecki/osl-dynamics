@@ -673,8 +673,6 @@ class Model(ModelBase):
             log_B = self.get_log_likelihood(x)
             batch_size, sequence_length, n_states = log_B.shape
             log_B = log_B.transpose(2, 0, 1).reshape(n_states, -1).T
-            print(f"{n_states} {batch_size} {sequence_length}")
-            print(f"Reshaped log: {log_B.shape}")
             gamma, xi = self.baum_welch_log(log_B, Pi_0, P)
         else:
             B = self.get_likelihood(x)            
@@ -696,12 +694,9 @@ class Model(ModelBase):
         # Convert input data to log space
         log_P = np.log(P + EPS)
         
-        print(f"Input shapes: {log_P.shape}, {log_B.shape}, {Pi_0.shape}")
-        
         # Use the C++ forward-backward implementation
         log_prob, fwdlattice = _hmmc.forward_log(Pi_0, P, log_B)
         
-        print(f"fwdlattice shape: {fwdlattice.shape}")
         bwdlattice = _hmmc.backward_log(Pi_0, P, log_B)
         
         # Calculate gamma (state probabilities)
@@ -711,9 +706,7 @@ class Model(ModelBase):
         
         # Calculate xi (transition probabilities)
         log_xi = _hmmc.compute_log_xi(fwdlattice, P, bwdlattice, log_B)
-        print(f"log_xi shape: {log_xi.shape}")
-        print(f"gamma shape: {gamma.shape}")
-
+        
         xi = np.exp(log_xi)
         
         return gamma, xi
