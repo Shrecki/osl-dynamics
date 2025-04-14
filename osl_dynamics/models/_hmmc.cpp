@@ -391,5 +391,6 @@ PYBIND11_MODULE(_hmmc, m)
         .def("backward_log", backward_log)
         .def("compute_scaling_xi_sum", compute_scaling_xi_sum)
         .def("compute_log_xi_sum", compute_log_xi_sum)
+        .def("compute_log_xi", compute_log_xi)
         .def("viterbi", viterbi);
 }
