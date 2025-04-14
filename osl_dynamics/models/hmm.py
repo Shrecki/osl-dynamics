@@ -710,11 +710,11 @@ class Model(ModelBase):
         gamma = np.exp(log_gamma)
         
         # Calculate xi (transition probabilities)
-        log_xi = _hmmc.compute_log_xi_sum(fwdlattice, P, bwdlattice, log_B)
+        log_xi = _hmmc.compute_log_xi(fwdlattice, P, bwdlattice, log_B)
         print(f"log_xi shape: {log_xi.shape}")
         print(f"gamma shape: {gamma.shape}")
 
-        xi = np.exp(log_xi.reshape(log_B.shape[1]-1, -1))
+        xi = np.exp(log_xi)
         
         return gamma, xi
 

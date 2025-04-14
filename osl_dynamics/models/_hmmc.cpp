@@ -294,6 +294,42 @@ py::array_t<double> compute_log_xi_sum(
     return log_xi_sum_;
 }
 
+py::array_t<double> compute_log_xi(
+    py::array_t<double> fwdlattice_,
+    py::array_t<double> transmat_,
+    py::array_t<double> bwdlattice_,
+    py::array_t<double> log_frameprob_)
+{
+    auto fwd = fwdlattice_.unchecked<2>();
+    auto log_transmat_ = log(transmat_);
+    auto log_transmat = log_transmat_.unchecked<2>();
+    auto bwd = bwdlattice_.unchecked<2>();
+    auto log_frameprob = log_frameprob_.unchecked<2>();
+    auto ns = log_frameprob.shape(0), nc = log_frameprob.shape(1);
+    if (fwd.shape(0) != ns || fwd.shape(1) != nc || log_transmat.shape(0) != nc || log_transmat.shape(1) != nc || bwd.shape(0) != ns || bwd.shape(1) != nc)
+    {
+        throw std::invalid_argument{"shape mismatch"};
+    }
+    auto log_prob = logsumexp(&fwd(ns - 1, 0), nc);
+    auto log_xi_ = py::array_t<double>{{ns - 1, nc, nc}};
+    auto log_ximut = log_xi_.mutable_unchecked<3>();
+    std::fill_n(log_ximut.mutable_data(0, 0, 0), log_ximut.size(),
+                -std::numeric_limits<double>::infinity());
+    py::gil_scoped_release nogil;
+    for (auto t = 0; t < ns - 1; ++t)
+    {
+        for (auto i = 0; i < nc; ++i)
+        {
+            for (auto j = 0; j < nc; ++j)
+            {
+                auto log_xi = fwd(t, i) + log_transmat(i, j) + log_frameprob(t + 1, j) + bwd(t + 1, j) - log_prob;
+                log_ximut(t, i, j) = log_xi;
+            }
+        }
+    }
+    return log_xi_;
+}
+
 std::tuple<double, py::array_t<ssize_t>> viterbi(
     py::array_t<double> startprob_,
     py::array_t<double> transmat_,
