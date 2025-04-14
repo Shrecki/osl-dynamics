@@ -667,19 +667,17 @@ class Model(ModelBase):
             (batch_size*sequence_length-1, n_states*n_states).
         """
         P = self.trans_prob
+        Pi_0 = self.state_probs_t0
 
         if self.config.implementation == "log":
             log_B = self.get_log_likelihood(x)
             batch_size, sequence_length, n_states = log_B.shape
-            log_B = log_B.transpose(2, 0, 1).reshape(n_states, -1)
+            log_B = log_B.transpose(2, 0, 1).reshape(n_states, -1).T
             print(f"{n_states} {batch_size} {sequence_length}")
             print(f"Reshaped log: {log_B.shape}")
-            log_Pi_0 = np.log(self.state_probs_t0 + EPS)
-            gamma, xi = self.baum_welch_log(log_B, log_Pi_0, P)
+            gamma, xi = self.baum_welch_log(log_B, Pi_0, P)
         else:
-            B = self.get_likelihood(x)
-            
-            Pi_0 = self.state_probs_t0
+            B = self.get_likelihood(x)            
             gamma, xi = self.baum_welch(B, Pi_0, P)
         return gamma,xi
     
@@ -690,7 +688,7 @@ class Model(ModelBase):
         return a
     
     @numba.jit
-    def baum_welch_log(self, log_B, log_Pi_0, P):
+    def baum_welch_log(self, log_B, Pi_0, P):
         """Hidden state inference using the Baum-Welch algorithm with C++ optimizations.
         
         Uses the _hmmc.cpp implementation for faster log-space calculations.
@@ -698,12 +696,13 @@ class Model(ModelBase):
         # Convert input data to log space
         log_P = np.log(P + EPS)
         
-        print(f"Input shapes: {log_P.shape}, {log_B.shape}, {log_Pi_0.shape}")
+        print(f"Input shapes: {log_P.shape}, {log_B.shape}, {Pi_0.shape}")
         
         # Use the C++ forward-backward implementation
-        log_prob, fwdlattice = _hmmc.forward_log(log_Pi_0, log_P, log_B)
+        log_prob, fwdlattice = _hmmc.forward_log(Pi_0, P, log_B)
+        
         print(f"fwdlattice shape: {fwdlattice.shape}")
-        bwdlattice = _hmmc.backward_log(log_Pi_0, log_P, log_B)
+        bwdlattice = _hmmc.backward_log(Pi_0, P, log_B)
         
         # Calculate gamma (state probabilities)
         log_gamma = fwdlattice + bwdlattice
