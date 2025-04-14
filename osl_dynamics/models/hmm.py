@@ -671,6 +671,7 @@ class Model(ModelBase):
         if self.config.implementation == "log":
             log_B = self.get_log_likelihood(x)
             n_states, batch_size, sequence_length = log_B.shape
+            print(f"{n_states} {batch_size} {sequence_length}")
             log_B = log_B.reshape((n_states, batch_size*sequence_length))
             log_Pi_0 = np.log(self.state_probs_t0 + EPS)
             gamma, xi = self.baum_welch_log(log_B, log_Pi_0, P)
