@@ -348,6 +348,13 @@ class Model(ModelBase):
         # Training curves
         history = {"loss": [], "rho": [], "lr": [], "fo": [], "max_dfo": []}
 
+        from keras.callbacks import EarlyStopping
+
+        # create this once, before the loop
+        stopper = EarlyStopping(monitor='loss', min_delta=1e-4, patience=20, verbose=1)
+        stopper.set_model(self.model)
+        stopper.on_train_begin()
+        
         # Loop through epochs
         if use_tqdm:
             _range = trange(epochs)
@@ -433,6 +440,12 @@ class Model(ModelBase):
             if dfo_tol > 0:
                 print(f"Max change in FO: {max_dfo}")
             if max_dfo < dfo_tol:
+                break
+            
+            logs = {'loss': history['loss'][-1]}
+            stopper.on_epoch_end(n,logs)
+            if stopper.stopped_epoch > 0:
+                print(f"Stopping at epoch {n}")
                 break
 
         if checkpoint_freq is not None:
@@ -853,6 +866,9 @@ class Model(ModelBase):
         # https://www.sciencedirect.com/science/article/pii/S1053811917305487
         self.trans_prob = (1 - self.rho) * self.trans_prob + self.rho * phi_interim
         self.trans_prob = (1-kappa)*self.trans_prob + sticky_counts*kappa
+        
+        # Ensure FP errors doesn't cause a drift in normalization.
+        self.trans_prob /= self.trans_prob.sum(axis=1, keepdims=True)
 
     def _update_rho(self, ind):
         """Update rho.
