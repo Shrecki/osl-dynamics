@@ -41,6 +41,7 @@ from osl_dynamics.inference.layers import (
     DiagonalMatricesLayer,
     VectorsLayer,
     StaticLossScalingFactorLayer,
+    CholeskyFactorsLayer
 )
 from osl_dynamics.models import obs_mod
 from osl_dynamics.models.mod_base import BaseModelConfig, ModelBase
@@ -798,7 +799,7 @@ class Model(ModelBase):
         """
         _logger.debug("Getting likelihood")
         # Get the current observation model parameters
-        means, covs = self.get_means_covariances()
+        means, trils = self.get_means_scale_trils()
         n_states = means.shape[0]
 
         batch_size = x.shape[0]
@@ -811,7 +812,7 @@ class Model(ModelBase):
             mvn = tf.stop_gradient(
                 tfp.distributions.MultivariateNormalTriL(
                     loc=tf.gather(means, state, axis=-2),
-                    scale_tril=tf.linalg.cholesky(tf.gather(covs, state, axis=-3)),
+                    scale_tril=tf.gather(trils, state, axis=-3),
                     allow_nan_stats=False,
                 )
             )
@@ -1007,11 +1008,11 @@ class Model(ModelBase):
         log_likelihood : np.ndarray
             Log-likelihood. Shape is (batch_size, ..., n_states)
         """
-        means, covs = self.get_means_covariances()
+        means, trils = self.get_means_scale_trils()
         mvn = tf.stop_gradient(
             tfp.distributions.MultivariateNormalTriL(
                 loc=means,
-                scale_tril=tf.linalg.cholesky(covs),
+                scale_tril=trils,
                 allow_nan_stats=False,
             )
         )
@@ -1070,6 +1071,9 @@ class Model(ModelBase):
             State means. Shape is (n_states, n_channels).
         """
         return obs_mod.get_observation_model_parameter(self.model, "means")
+    
+    def get_trils(self):
+        return obs_mod.get_observation_model_parameter(self.model,"trils")
 
     def get_covariances(self):
         """Get the state covariances.
@@ -1079,7 +1083,7 @@ class Model(ModelBase):
         covariances : np.ndarray
             State covariances. Shape is (n_states, n_channels, n_channels).
         """
-        return obs_mod.get_observation_model_parameter(self.model, "covs")
+        return tfp.bijectors.CholeskyOuterProduct()(obs_mod.get_observation_model_parameter(self.model,"trils"))
 
     def get_means_covariances(self):
         """Get the state means and covariances.
@@ -1094,6 +1098,9 @@ class Model(ModelBase):
             State covariances.
         """
         return self.get_means(), self.get_covariances()
+    
+    def get_means_scale_trils(self):
+        return self.get_means(), self.get_trils()
 
     def get_observation_model_parameters(self):
         """Wrapper for :code:`get_means_covariances`."""
@@ -1969,14 +1976,15 @@ class Model(ModelBase):
                 name="covs",
             )
         else:
-            covs_layer = CovarianceMatricesLayer(
+            init_L = tf.linalg.cholesky(tf.convert_to_tensor(config.initial_covariances, tf.float32))
+            covs_layer = CholeskyFactorsLayer(
                 config.n_states,
                 config.n_channels,
                 config.learn_covariances,
-                config.initial_covariances,
+                init_L,
                 config.covariances_epsilon,
                 config.covariances_regularizer,
-                name="covs",
+                name="trils",
             )
             
             

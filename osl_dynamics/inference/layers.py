@@ -704,6 +704,104 @@ class CovarianceMatricesLayer(layers.Layer):
         covariances = self.bijector(flattened_cholesky_factors)
         covariances = add_epsilon(covariances, self.epsilon, diag=True)
         return covariances
+    
+    
+class CholeskyFactorsLayer(layers.Layer):
+    """Layer to learn a set of covariance matrices as Cholesky factors for efficiency.
+
+    A cholesky factor is learnt as a vector of free parameters. It is not explicitly
+    transformed back to a covariance matrix, as training relies on cholesky factors.
+
+    Parameters
+    ----------
+    n : int
+        Number of matrices.
+    m : int
+        Number of rows/columns.
+    learn : bool
+        Should the matrices be learnable?
+    initial_value : np.ndarray
+        Initial values for the Cholesky facgtors. Shape must be (n, m, m).
+    epsilon : float
+        Error added to the diagonal of covariances matrices for numerical
+        stability.
+    regularizer : osl-dynamics regularizer, optional
+        Regularizer for the tensor. Must be from `inference.regularizers 
+        <https://osl-dynamics.readthedocs.io/en/latest/autoapi/osl_dynamics\
+        /inference/regularizers/index.html>`_.
+    kwargs : keyword arguments, optional
+        Keyword arguments to pass to the base class.
+    """
+
+    def __init__(
+        self,
+        n,
+        m,
+        learn,
+        initial_value,
+        epsilon,
+        regularizer=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.epsilon = epsilon
+
+        # Bijector used to transform learnable vectors to covariance matrices
+        self.bijector = tfb.FillScaleTriL()
+
+        # Do we have an initial value?
+        if initial_value is not None:
+            # Check it's the correct shape
+            if initial_value.shape != (n, m, m):
+                raise ValueError(f"initial_value shape must be ({n}, {m}, {m}).")
+
+            # Calculate the flattened cholesky factors
+            initial_value = initial_value.astype("float32")
+            initial_flattened_cholesky_factors = self.bijector.inverse(
+                initial_value,
+            )
+
+            # We don't need an initializer
+            initializer = None
+        else:
+            # No initial value has been passed
+            initial_flattened_cholesky_factors = None
+            if learn:
+                # Use a random initializer
+                initializer = osld_initializers.NormalIdentityCholeskyInitializer(
+                    std=0.1,
+                )
+            else:
+                # Use the identity matrix for each mode/state
+                initializer = osld_initializers.IdentityCholeskyInitializer()
+
+        # Create a layer to learn the covariance matrices
+        #
+        # We use self.layers for compatibility with
+        # initializers.reinitialize_model_weights
+        self.layers = [
+            LearnableTensorLayer(
+                shape=(n, m * (m + 1) // 2),
+                learn=learn,
+                initializer=initializer,
+                initial_value=initial_flattened_cholesky_factors,
+                regularizer=regularizer,
+                name=self.name + "_kernel",
+            )
+        ]
+
+    def call(self, inputs, **kwargs):
+        """
+        Note
+        ----
+        The :code:`inputs` passed to this method are not used.
+        """
+        learnable_tensor_layer = self.layers[0]
+        flattened_cholesky_factors = learnable_tensor_layer(inputs, **kwargs)
+        L = self.bijector(flattened_cholesky_factors)
+        L = tf.linalg.set_diag(L, tf.linalg.diag_part(L) + self.epsilon)
+        #   tril_factors = add_epsilon(tril_factors, self.epsilon, diag=True)
+        return L
 
 
 class CorrelationMatricesLayer(layers.Layer):
