@@ -96,7 +96,7 @@ def set_observation_model_parameter(
     obs_layer = model.get_layer(layer_name)
     learnable_tensor_layer = obs_layer.layers[0]
 
-    if layer_name not in ["means", "group_means", "log_rates", "trils"]:
+    if layer_name not in ["means", "group_means", "log_rates"]:
         print(obs_parameter.shape)
         obs_parameter = obs_layer.bijector.inverse(obs_parameter)
 
