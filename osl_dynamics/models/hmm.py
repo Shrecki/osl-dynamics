@@ -1976,7 +1976,7 @@ class Model(ModelBase):
                 name="covs",
             )
         else:
-            init_L = tf.linalg.cholesky(tf.convert_to_tensor(config.initial_covariances, tf.float32))
+            init_L = tf.linalg.cholesky(tf.convert_to_tensor(config.initial_covariances, tf.float32)) if config.initial_covariances is not None else None
             covs_layer = CholeskyFactorsLayer(
                 config.n_states,
                 config.n_channels,
