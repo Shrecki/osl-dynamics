@@ -79,6 +79,7 @@ def set_observation_model_parameter(
         "group_means",
         "group_covs",
         "log_rates",
+        "trils"
     ]
     if layer_name not in available_layers:
         raise ValueError(
@@ -95,7 +96,7 @@ def set_observation_model_parameter(
     obs_layer = model.get_layer(layer_name)
     learnable_tensor_layer = obs_layer.layers[0]
 
-    if layer_name not in ["means", "group_means", "log_rates"]:
+    if layer_name not in ["means", "group_means", "log_rates", "trils"]:
         obs_parameter = obs_layer.bijector.inverse(obs_parameter)
 
     learnable_tensor_layer.tensor.assign(obs_parameter)
@@ -231,6 +232,7 @@ def set_covariances_regularizer(
     training_dataset,
     epsilon,
     diagonal=False,
+    tril=False,
     layer_name="covs",
 ):
     """Set the covariances regularizer based on training data.
@@ -270,12 +272,21 @@ def set_covariances_regularizer(
         )
 
     else:
-        nu = n_channels - 1 + 0.1
-        psi = np.diag(range_)
-        learnable_tensor_layer = covs_layer.layers[0]
-        learnable_tensor_layer.regularizer = regularizers.InverseWishart(
-            nu, psi, epsilon
-        )
+        if tril:
+            sigma = np.sqrt(np.log(2 * range_))
+            learnable_tensor_layer = covs_layer.layers[0]
+            learnable_tensor_layer.regularizer = regularizers.LogDiagonalCholeskyPrior(
+                mu,
+                sigma,
+                epsilon,
+            )
+        else:
+            nu = n_channels - 1 + 0.1
+            psi = np.diag(range_)
+            learnable_tensor_layer = covs_layer.layers[0]
+            learnable_tensor_layer.regularizer = regularizers.InverseWishart(
+                nu, psi, epsilon
+            )
         
 
 

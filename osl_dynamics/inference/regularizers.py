@@ -11,6 +11,36 @@ from osl_dynamics.inference.layers import add_epsilon
 
 tfb = tfp.bijectors
 
+class LogDiagonalCholeskyPrior(regularizers.Regularizer):
+    """
+    Gaussian prior on log(diagonal(L)), where L is a Cholesky factor
+    produced via FillScaleTriL from flattened parameters.
+    """
+
+    def __init__(self, mu, sigma, epsilon):
+        """
+        Parameters
+        ----------
+        mu : array-like, shape (D,)
+            Target mean for log L_ii (data-driven).
+        sigma : float
+            Standard deviation of the prior.
+        """
+        self.mu = tf.constant(mu, dtype=tf.float32)     # (D,)
+        self.sigma = float(sigma)
+        self.epsilon = float(epsilon)
+        self.fill = tfb.FillScaleTriL()
+
+    def __call__(self, flattened_cholesky_factors):
+        # flattened_cholesky_factors: (K, D(D+1)/2)
+        L = self.fill(flattened_cholesky_factors)       # (K, D, D)
+
+        log_diag = tf.math.log(tf.linalg.diag_part(L))  # (K, D)
+        diff = log_diag - self.mu[None, :]              # broadcast over K
+
+        reg = tf.reduce_sum(diff ** 2) / (2.0 * self.sigma ** 2)
+        return reg
+
 
 class InverseWishart(regularizers.Regularizer):
     """Inverse Wishart regularizer.

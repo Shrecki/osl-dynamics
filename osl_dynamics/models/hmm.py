@@ -1136,8 +1136,8 @@ class Model(ModelBase):
         """
         obs_mod.set_observation_model_parameter(
             self.model,
-            covariances,
-            layer_name="covs",
+            tf.linalg.cholesky(tf.convert_to_tensor(covariances, tf.float32)),
+            layer_name="trils",
             update_initializer=update_initializer,
             diagonal_covariances=self.config.diagonal_covariances,
         )
@@ -1284,11 +1284,13 @@ class Model(ModelBase):
             obs_mod.set_means_regularizer(self.model, training_dataset)
 
         if self.config.learn_covariances:
+            
             obs_mod.set_covariances_regularizer(
                 self.model,
                 training_dataset,
                 self.config.covariances_epsilon,
                 self.config.diagonal_covariances,
+                tril=True,layer_name="trils"
             )
 
     def free_energy(self, dataset):
