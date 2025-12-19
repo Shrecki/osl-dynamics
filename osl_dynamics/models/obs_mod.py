@@ -85,8 +85,8 @@ def set_observation_model_parameter(
         raise ValueError(
             f"Layer name {layer_name} not in available layers {available_layers}."
         )
-
-    obs_parameter = obs_parameter.astype(np.float32)
+    if layer_name != "trils":
+        obs_parameter = obs_parameter.astype(np.float32)
 
     if layer_name == "stds" or (layer_name == "covs" and diagonal_covariances):
         if obs_parameter.ndim == 3:
