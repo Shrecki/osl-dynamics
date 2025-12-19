@@ -746,7 +746,7 @@ class CholeskyFactorsLayer(layers.Layer):
         super().__init__(**kwargs)
         self.epsilon = epsilon
 
-        # Bijector used to transform learnable vectors to covariance matrices
+        # Bijector used to transform learnable vectors to Cholesky matrices
         self.bijector = tfb.FillScaleTriL()
 
         # Do we have an initial value?
