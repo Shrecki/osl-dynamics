@@ -38,6 +38,7 @@ def get_observation_model_parameter(model, layer_name):
         "group_means",
         "group_covs",
         "log_rates",
+        "trils"
     ]
     if layer_name not in available_layers:
         raise ValueError(
