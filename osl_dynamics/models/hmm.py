@@ -396,8 +396,10 @@ class Model(ModelBase):
                 # -> (batch_size, sequence_length, n_states)
                 gamma = gamma.reshape(x.shape[0], x.shape[1], -1)
 
+                # Convert to tensor: avoids reconverting x over and over!
+                gamma = tf.convert_to_tensor(gamma, dtype=tf.float32)
                 # Update observation model
-                x_and_gamma = np.concatenate([x, gamma], axis=2)
+                x_and_gamma = tf.concat([x, gamma], axis=2)
                 h = None
                 h = self.model.fit(x_and_gamma, epochs=1, verbose=0, **kwargs)
                 
@@ -1033,7 +1035,8 @@ class Model(ModelBase):
         -------
         log_likelihood : np.ndarray
             Log-likelihood. Shape is (batch_size, ..., n_states)"""
-        data = tf.convert_to_tensor(data, dtype=tf.float32)
+        #data = tf.convert_to_tensor(data, dtype=tf.float32)
+        assert tf.is_tensor(data)
         
         means, trils = self.get_means_scale_trils(tensor=True)
         
