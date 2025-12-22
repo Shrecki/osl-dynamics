@@ -49,6 +49,39 @@ def get_observation_model_parameter(model, layer_name):
     return obs_parameter.numpy()
 
 
+def get_observation_model_parameter_tensor(model, layer_name):
+    """Get the parameter of an observation model layer, in tensor form.
+
+    Parameters
+    ----------
+    model : osl_dynamics.models.*.Model.model
+        The model.
+    layer_name : str
+        Name of the layer of the observation model parameter.
+
+    Returns
+    -------
+    obs_parameter : tf.tensor
+        The observation model parameter.
+    """
+    available_layers = [
+        "means",
+        "covs",
+        "stds",
+        "corrs",
+        "group_means",
+        "group_covs",
+        "log_rates",
+        "trils"
+    ]
+    if layer_name not in available_layers:
+        raise ValueError(
+            f"Layer name {layer_name} not in available layers {available_layers}."
+        )
+    obs_layer = model.get_layer(layer_name)
+    obs_parameter = obs_layer(1)
+    return obs_parameter
+
 def set_observation_model_parameter(
     model,
     obs_parameter,

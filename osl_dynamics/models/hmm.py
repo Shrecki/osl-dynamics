@@ -995,13 +995,22 @@ class Model(ModelBase):
 
         return first_term + remaining_terms
     
+    from contextlib import contextmanager
+
+    @contextmanager
+    def log_device_placement():
+        """Context manager to temporarily enable device placement logging."""
+        tf.debugging.set_log_device_placement(True)
+        try:
+            yield
+        finally:
+            tf.debugging.set_log_device_placement(False)
     
     @tf.function
-    def get_log_likelihood_graph(self, data):
+    def get_log_likelihood_graph(self, means,trils, data):
         r"""Get the log-likelihood of data, using
         tensorflow graphs to ensure automatic device placement.
         """
-        means, trils = self.get_means_scale_trils()
         mvn = tf.stop_gradient(
             tfp.distributions.MultivariateNormalTriL(
                 loc=means,
@@ -1025,7 +1034,11 @@ class Model(ModelBase):
         log_likelihood : np.ndarray
             Log-likelihood. Shape is (batch_size, ..., n_states)"""
         data = tf.convert_to_tensor(data, dtype=tf.float32)
-        return self.get_log_likelihood_graph(data).numpy()
+        
+        means, trils = self.get_means_scale_trils(tensor=True)
+        
+        with self.log_device_placement():
+            return self.get_log_likelihood_graph(means,trils,data).numpy()
 
     
 
@@ -1072,7 +1085,7 @@ class Model(ModelBase):
         """
         return self.trans_prob
 
-    def get_means(self):
+    def get_means(self, tensor=False):
         """Get the state means.
 
         Returns
@@ -1080,10 +1093,16 @@ class Model(ModelBase):
         means : np.ndarray
             State means. Shape is (n_states, n_channels).
         """
-        return obs_mod.get_observation_model_parameter(self.model, "means")
+        if tensor:
+            return obs_mod.get_observation_model_parameter_tensor(self.model, "means")
+        else:
+            return obs_mod.get_observation_model_parameter(self.model, "means")
     
-    def get_trils(self):
-        return obs_mod.get_observation_model_parameter(self.model,"trils")
+    def get_trils(self, tensor=False):
+        if tensor:
+            return obs_mod.get_observation_model_parameter_tensor(self.model,"trils")
+        else:    
+            return obs_mod.get_observation_model_parameter(self.model,"trils")
 
     def get_covariances(self):
         """Get the state covariances.
@@ -1109,8 +1128,8 @@ class Model(ModelBase):
         """
         return self.get_means(), self.get_covariances()
     
-    def get_means_scale_trils(self):
-        return self.get_means(), self.get_trils()
+    def get_means_scale_trils(self,tensor=False):
+        return self.get_means(tensor), self.get_trils(tensor)
 
     def get_observation_model_parameters(self):
         """Wrapper for :code:`get_means_covariances`."""
