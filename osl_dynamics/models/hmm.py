@@ -720,30 +720,40 @@ class Model(ModelBase):
         a -= a_lse
         return a
     
-    @numba.jit
+    # @numba.jit
     def baum_welch_log(self, log_B, Pi_0, P):
         """Hidden state inference using the Baum-Welch algorithm with C++ optimizations.
         
         Uses the _hmmc.cpp implementation for faster log-space calculations.
         """
         # Convert input data to log space
+        import time
+        start_conv = time.time()
         log_P = np.log(P + EPS)
+        end_conv = time.time()
         
         # Use the C++ forward-backward implementation
+        start_fw = time.time()
         log_prob, fwdlattice = _hmmc.forward_log(Pi_0, P, log_B)
+        end_fw = time.time()
         
+        start_bw = time.time()
         bwdlattice = _hmmc.backward_log(Pi_0, P, log_B)
+        end_bw = time.time()
         
         # Calculate gamma (state probabilities)
+        start_gamma = time.time()
         log_gamma = fwdlattice + bwdlattice
         self.log_normalize(log_gamma, axis=1)
         gamma = np.exp(log_gamma)
+        end_gamma = time.time()
         
         # Calculate xi (transition probabilities)
+        start_xi = time.time()
         log_xi = _hmmc.compute_log_xi(fwdlattice, P, bwdlattice, log_B)
-        
         xi = np.exp(log_xi)
-        
+        end_xi = time.time()
+        print(f"conv: {end_conv-start_conv}\nfw: {end_fw-start_fw}\nbw: {end_bw-start_bw}\ngamma: {end_gamma-start_gamma}\nxi:{end_xi - start_xi}")
         return gamma, xi
 
     @numba.jit
