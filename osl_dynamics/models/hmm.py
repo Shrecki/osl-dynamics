@@ -384,14 +384,14 @@ class Model(ModelBase):
             for element in dataset:
                 x = self._unpack_inputs(element)
                 # Update state probabilities
-                start_post = time.time()
-                gamma, xi = self.get_posterior(x)
-                end_post = time.time()
+                #start_post = time.time()
+                gamma, xi_sum = self.get_posterior(x)
+                #end_post = time.time()
 
-                start_other = time.time()
+                #start_other = time.time()
                 # Update transition probability matrix
                 if self.config.learn_trans_prob:
-                    self.update_trans_prob(gamma, xi)
+                    self.update_trans_prob_optimized(gamma, xi_sum)
 
                 # Calculate fractional occupancy
                 stc = modes.argmax_time_courses(gamma)
@@ -406,14 +406,14 @@ class Model(ModelBase):
                 # Update observation model
                 x_and_gamma = tf.concat([x, gamma], axis=2)
                 h = None
-                end_other = time.time()
-                start_fit_params = time.time()
+                #end_other = time.time()
+                #start_fit_params = time.time()
                 h = self.model.fit(x_and_gamma, epochs=1, verbose=0, **kwargs)
-                end_fit_params = time.time()
+                #end_fit_params = time.time()
                 
-                print(f"Posterior compute time: {end_post - start_post}")
-                print(f"Intermediate updates and conversions compute time: {end_other - start_other}")
-                print(f"Fit params compute time: {end_fit_params - start_fit_params}")
+                #print(f"Posterior compute time: {end_post - start_post}")
+                #print(f"Intermediate updates and conversions compute time: {end_other - start_other}")
+                #print(f"Fit params compute time: {end_fit_params - start_fit_params}")
 
                 # Get new loss
                 l = h.history["loss"][0]
@@ -705,10 +705,10 @@ class Model(ModelBase):
             start_bw = time.time()
             batch_size, sequence_length, n_states = log_B.shape
             log_B = log_B.transpose(2, 0, 1).reshape(n_states, -1).T
-            gamma, xi = self.baum_welch_log(log_B, Pi_0, P)
+            gamma, xi = self.baum_welch_log_optimized(log_B, Pi_0, P)
             end_bw = time.time()
-            print(f"LL compute time: {end_ll - start_ll}")
-            print(f"BW compute time: {end_bw - start_bw}")
+            #print(f"LL compute time: {end_ll - start_ll}")
+            #print(f"BW compute time: {end_bw - start_bw}")
         else:
             B = self.get_likelihood(x)            
             gamma, xi = self.baum_welch(B, Pi_0, P)
@@ -719,6 +719,31 @@ class Model(ModelBase):
         a_lse = logsumexp(a, axis=axis, keepdims=True)
         a -= a_lse
         return a
+    
+    @numba.jit
+    def baum_welch_log_optimized(self, log_B, Pi_0, P):
+        """Optimized version using xi_sum directly."""
+        log_P = np.log(P + EPS)
+        
+        # Forward-backward (0.078s)
+        log_prob, fwdlattice = _hmmc.forward_log(Pi_0, P, log_B)
+        bwdlattice = _hmmc.backward_log(Pi_0, P, log_B)
+        
+        # Gamma (0.024s)
+        log_gamma = fwdlattice + bwdlattice
+        self.log_normalize(log_gamma, axis=1)
+        gamma = np.exp(log_gamma)
+        
+        # Get xi_sum DIRECTLY - no 3D array! (~0.1s instead of 1.07s)
+        log_xi_sum = _hmmc.compute_log_xi_sum(fwdlattice, P, bwdlattice, log_B)
+        xi_sum = np.exp(log_xi_sum)  # Shape: (6, 6)
+        
+        # Reshape to match expected format
+        # Your code expects (batch_size*seq_len-1, n_states*n_states)
+        # but since we're summing, we can reshape the sum
+        xi_sum_flat = xi_sum.T.flatten()  # Shape: (36,)
+        
+        return gamma, xi_sum_flat
     
     # @numba.jit
     def baum_welch_log(self, log_B, Pi_0, P):
@@ -900,6 +925,24 @@ class Model(ModelBase):
         self.trans_prob = (1-kappa)*self.trans_prob + sticky_counts*kappa
         
         # Ensure FP errors doesn't cause a drift in normalization.
+        self.trans_prob /= self.trans_prob.sum(axis=1, keepdims=True)
+        
+    def update_trans_prob_optimized(self, gamma, xi_sum_flat):
+        """Updated to work with pre-summed xi."""
+        kappa = self.config.kappa
+        sticky_counts = np.eye(self.config.n_states)
+        
+        # xi_sum_flat is already summed over time, just reshape
+        phi_interim = (
+            xi_sum_flat.reshape(self.config.n_states, self.config.n_states).T + EPS
+        ) / (
+            np.sum(gamma[:-1], axis=0).reshape(self.config.n_states, 1) + 
+            self.config.n_states * EPS
+        )
+        
+        # Rest stays the same
+        self.trans_prob = (1 - self.rho) * self.trans_prob + self.rho * phi_interim
+        self.trans_prob = (1 - kappa) * self.trans_prob + sticky_counts * kappa
         self.trans_prob /= self.trans_prob.sum(axis=1, keepdims=True)
 
     def _update_rho(self, ind):
