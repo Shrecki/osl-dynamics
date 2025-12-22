@@ -998,7 +998,7 @@ class Model(ModelBase):
     from contextlib import contextmanager
 
     @contextmanager
-    def log_device_placement():
+    def log_device_placement(self):
         """Context manager to temporarily enable device placement logging."""
         tf.debugging.set_log_device_placement(True)
         try:
