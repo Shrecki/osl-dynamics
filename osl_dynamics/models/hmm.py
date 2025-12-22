@@ -1037,8 +1037,7 @@ class Model(ModelBase):
         
         means, trils = self.get_means_scale_trils(tensor=True)
         
-        with self.log_device_placement():
-            return self.get_log_likelihood_graph(means,trils,data).numpy()
+        return self.get_log_likelihood_graph(means,trils,data).numpy()
 
     
 
