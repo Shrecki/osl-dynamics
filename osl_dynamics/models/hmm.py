@@ -356,6 +356,8 @@ class Model(ModelBase):
         stopper.set_model(self.model)
         stopper.on_train_begin()
         
+        import time
+
         # Loop through epochs
         if use_tqdm:
             _range = trange(epochs)
@@ -382,8 +384,11 @@ class Model(ModelBase):
             for element in dataset:
                 x = self._unpack_inputs(element)
                 # Update state probabilities
+                start_post = time.time()
                 gamma, xi = self.get_posterior(x)
+                end_post = time.time()
 
+                start_other = time.time()
                 # Update transition probability matrix
                 if self.config.learn_trans_prob:
                     self.update_trans_prob(gamma, xi)
@@ -401,8 +406,15 @@ class Model(ModelBase):
                 # Update observation model
                 x_and_gamma = tf.concat([x, gamma], axis=2)
                 h = None
+                end_other = time.time()
+                start_fit_params = time.time()
                 h = self.model.fit(x_and_gamma, epochs=1, verbose=0, **kwargs)
+                end_fit_params = time.time()
                 
+                print(f"Posterior compute time: {end_post - start_post}")
+                print(f"Intermediate updates and conversions compute time: {end_other - start_other}")
+                print(f"Fit params compute time: {end_fit_params - start_fit_params}")
+
                 # Get new loss
                 l = h.history["loss"][0]
                 if np.isnan(l):
@@ -684,12 +696,19 @@ class Model(ModelBase):
         """
         P = self.trans_prob
         Pi_0 = self.state_probs_t0
+        import time
 
         if self.config.implementation == "log":
+            start_ll = time.time()
             log_B = self.get_log_likelihood(x)
+            end_ll = time.time()
+            start_bw = time.time()
             batch_size, sequence_length, n_states = log_B.shape
             log_B = log_B.transpose(2, 0, 1).reshape(n_states, -1).T
             gamma, xi = self.baum_welch_log(log_B, Pi_0, P)
+            end_bw = time.time()
+            print(f"LL compute time: {end_ll - start_ll}")
+            print(f"BW compute time: {end_bw - start_bw}")
         else:
             B = self.get_likelihood(x)            
             gamma, xi = self.baum_welch(B, Pi_0, P)
