@@ -994,6 +994,23 @@ class Model(ModelBase):
         )
 
         return first_term + remaining_terms
+    
+    
+    @tf.function
+    def get_log_likelihood_graph(self, data):
+        r"""Get the log-likelihood of data, using
+        tensorflow graphs to ensure automatic device placement.
+        """
+        means, trils = self.get_means_scale_trils()
+        mvn = tf.stop_gradient(
+            tfp.distributions.MultivariateNormalTriL(
+                loc=means,
+                scale_tril=trils,
+                allow_nan_stats=False,
+            )
+        )
+        log_likelihood = mvn.log_prob(tf.expand_dims(data, axis=-2))
+        return log_likelihood
 
     def get_log_likelihood(self, data):
         r"""Get the log-likelihood of data, :math:`\log p(x_t | s_t)`.
@@ -1006,18 +1023,11 @@ class Model(ModelBase):
         Returns
         -------
         log_likelihood : np.ndarray
-            Log-likelihood. Shape is (batch_size, ..., n_states)
-        """
-        means, trils = self.get_means_scale_trils()
-        mvn = tf.stop_gradient(
-            tfp.distributions.MultivariateNormalTriL(
-                loc=means,
-                scale_tril=trils,
-                allow_nan_stats=False,
-            )
-        )
-        log_likelihood = mvn.log_prob(tf.expand_dims(data, axis=-2))
-        return log_likelihood.numpy()
+            Log-likelihood. Shape is (batch_size, ..., n_states)"""
+        data = tf.convert_to_tensor(data, dtype=tf.float32)
+        return self.get_log_likelihood_graph(data).numpy()
+
+    
 
     def get_stationary_distribution(self):
         """Get the stationary distribution of the Markov chain.
