@@ -356,7 +356,7 @@ class Model(ModelBase):
         stopper.set_model(self.model)
         stopper.on_train_begin()
         
-        import time
+        #import time
 
         # Loop through epochs
         if use_tqdm:
@@ -696,19 +696,19 @@ class Model(ModelBase):
         """
         P = self.trans_prob
         Pi_0 = self.state_probs_t0
-        import time
+        #import time
 
         if self.config.implementation == "log":
-            start_ll = time.time()
+            #start_ll = time.time()
             log_B = self.get_log_likelihood(x)
-            end_ll = time.time()
-            start_bw = time.time()
+            #end_ll = time.time()
+            #start_bw = time.time()
             batch_size, sequence_length, n_states = log_B.shape
             log_B = log_B.transpose(2, 0, 1).reshape(n_states, -1).T
             gamma, xi = self.baum_welch_log_optimized(log_B, Pi_0, P)
-            end_bw = time.time()
-            print(f"LL compute time: {end_ll - start_ll}")
-            print(f"BW compute time: {end_bw - start_bw}")
+            #end_bw = time.time()
+            #print(f"LL compute time: {end_ll - start_ll}")
+            #print(f"BW compute time: {end_bw - start_bw}")
         else:
             B = self.get_likelihood(x)            
             gamma, xi = self.baum_welch(B, Pi_0, P)
@@ -752,33 +752,33 @@ class Model(ModelBase):
         Uses the _hmmc.cpp implementation for faster log-space calculations.
         """
         # Convert input data to log space
-        import time
-        start_conv = time.time()
+        #import time
+        #start_conv = time.time()
         log_P = np.log(P + EPS)
-        end_conv = time.time()
+        #end_conv = time.time()
         
         # Use the C++ forward-backward implementation
-        start_fw = time.time()
+        #start_fw = time.time()
         log_prob, fwdlattice = _hmmc.forward_log(Pi_0, P, log_B)
-        end_fw = time.time()
+        #end_fw = time.time()
         
-        start_bw = time.time()
+        #start_bw = time.time()
         bwdlattice = _hmmc.backward_log(Pi_0, P, log_B)
-        end_bw = time.time()
+        #end_bw = time.time()
         
         # Calculate gamma (state probabilities)
-        start_gamma = time.time()
+        #start_gamma = time.time()
         log_gamma = fwdlattice + bwdlattice
         self.log_normalize(log_gamma, axis=1)
         gamma = np.exp(log_gamma)
-        end_gamma = time.time()
+        #end_gamma = time.time()
         
         # Calculate xi (transition probabilities)
-        start_xi = time.time()
+        #start_xi = time.time()
         log_xi = _hmmc.compute_log_xi(fwdlattice, P, bwdlattice, log_B)
         xi = np.exp(log_xi)
-        end_xi = time.time()
-        print(f"conv: {end_conv-start_conv}\nfw: {end_fw-start_fw}\nbw: {end_bw-start_bw}\ngamma: {end_gamma-start_gamma}\nxi:{end_xi - start_xi}")
+        #end_xi = time.time()
+        #print(f"conv: {end_conv-start_conv}\nfw: {end_fw-start_fw}\nbw: {end_bw-start_bw}\ngamma: {end_gamma-start_gamma}\nxi:{end_xi - start_xi}")
         return gamma, xi
 
     @numba.jit
