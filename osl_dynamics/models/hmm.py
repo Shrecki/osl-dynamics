@@ -384,9 +384,9 @@ class Model(ModelBase):
             for element in dataset:
                 x = self._unpack_inputs(element)
                 # Update state probabilities
-                start_post = time.time()
+                #start_post = time.time()
                 gamma, xi_sum = self.get_posterior(x)
-                end_post = time.time()
+                #end_post = time.time()
 
                 #start_other = time.time()
                 # Update transition probability matrix
