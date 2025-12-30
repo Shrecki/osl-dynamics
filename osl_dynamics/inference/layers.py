@@ -1621,21 +1621,26 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
             sigma = tf.gather(sigma, session_id)
 
         # Log-likelihood for each state
-        ll_loss = tf.zeros(shape=tf.shape(x)[:-1])
-        for i in range(self.n_states):
-            if self.is_cholesky:
-                # sigma is already L, use directly!
-                scale_tril = tf.gather(sigma, i, axis=-3)
-            else:
-                # sigma is Σ, compute Cholesky
-                scale_tril = tf.linalg.cholesky(tf.gather(sigma, i, axis=-3))
-            mvn = tfp.distributions.MultivariateNormalTriL(
-                loc=tf.gather(mu, i, axis=-2),
-                scale_tril=scale_tril,
-                allow_nan_stats=False,
-            )
-            a = mvn.log_prob(x)
-            ll_loss += probs[:, :, i] * a
+        x_expanded = tf.expand_dims(x, axis=2)
+        # Create batch distribution for ALL states at once
+        if self.is_cholesky:
+            scale_tril = sigma  # Already (batch, n_states, n_channels, n_channels)
+        else:
+            scale_tril = tf.linalg.cholesky(sigma)
+        
+        # Create distribution for all states simultaneously
+        mvn = tfp.distributions.MultivariateNormalTriL(
+            loc=mu,  # (batch, n_states, n_channels)
+            scale_tril=scale_tril,  # (batch, n_states, n_channels, n_channels)
+            allow_nan_stats=False
+        )
+        
+        # Compute log_prob for all states at once
+        # This broadcasts x across all states
+        log_probs = mvn.log_prob(x_expanded)  # (batch, seq_len, n_states)
+        
+        # Weight by gamma and sum
+        ll_loss = tf.reduce_sum(probs * log_probs, axis=-1)  # (batch, seq_len)
 
         if self.calculation == "sum":
             # Sum over time dimension and average over the batch dimension
