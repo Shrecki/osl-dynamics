@@ -308,6 +308,7 @@ def set_covariances_regularizer(
 
     else:
         if tril:
+            mu = np.zeros([n_channels], dtype=np.float32)
             sigma = np.sqrt(np.log(2 * range_))
             learnable_tensor_layer = covs_layer.layers[0]
             learnable_tensor_layer.regularizer = regularizers.LogDiagonalCholeskyPrior(
