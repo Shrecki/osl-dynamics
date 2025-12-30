@@ -744,7 +744,7 @@ class CholeskyFactorsLayer(layers.Layer):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.epsilon = tf.float32(epsilon)
+        self.epsilon = epsilon
         
         # Bijector used to transform learnable vectors to Cholesky matrices
         self.bijector = tfb.FillScaleTriL()
@@ -1605,7 +1605,7 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
     def __init__(self, n_states, epsilon, calculation,is_cholesky=False, **kwargs):
         super().__init__(**kwargs)
         self.n_states = n_states
-        self.epsilon = epsilon
+        self.epsilon = tf.constant(epsilon, dtype=tf.float32)
         self.calculation = calculation
         self.is_cholesky=is_cholesky
 
