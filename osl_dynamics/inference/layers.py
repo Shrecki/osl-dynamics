@@ -798,25 +798,14 @@ class CholeskyFactorsLayer(layers.Layer):
         """
         learnable_tensor_layer = self.layers[0]
         flattened_cholesky_factors = learnable_tensor_layer(inputs, **kwargs)
+    
+        # Apply bijector first
+        L = self.bijector(flattened_cholesky_factors)
         
-        # Before applying bijector, ensure diagonal elements will be positive
-        # The diagonal elements are at indices 0, 2, 5, 9, ... (triangular numbers)
-        n, d = tf.shape(flattened_cholesky_factors)[0], tf.shape(flattened_cholesky_factors)[1]
-        
-        # Get triangular indices for diagonal
-        m = tf.cast(tf.sqrt(2 * tf.cast(d, tf.float32)), tf.int32)  # matrix dimension
-        diag_indices = tf.cumsum(tf.range(1, m + 1)) - 1  # [0, 2, 5, 9, ...]
-        
-        # Apply softplus to diagonal elements to ensure positivity
-        flat_safe = flattened_cholesky_factors
-        for idx in diag_indices:
-            flat_safe = tf.concat([
-                flat_safe[:, :idx],
-                tf.nn.softplus(flat_safe[:, idx:idx+1]) + self.epsilon,
-                flat_safe[:, idx+1:]
-            ], axis=1)
-        
-        L = self.bijector(flat_safe)
+        # Then ensure positive diagonal on the actual matrix
+        diag = tf.linalg.diag_part(L)
+        safe_diag = tf.nn.softplus(diag) + self.epsilon
+        L = tf.linalg.set_diag(L, safe_diag)
         return L
 
 
