@@ -2070,6 +2070,7 @@ class Model(ModelBase):
             config.means_regularizer,
             name="means",
         )
+        is_cholesky=False
         if config.diagonal_covariances:
             covs_layer = DiagonalMatricesLayer(
                 config.n_states,
@@ -2091,6 +2092,7 @@ class Model(ModelBase):
                 config.covariances_regularizer,
                 name="trils",
             )
+            is_cholesky = True
             
             
         # Data flow
@@ -2112,6 +2114,7 @@ class Model(ModelBase):
             config.covariances_epsilon,
             config.loss_calc,
             name="ll_loss",
+            is_cholesky=is_cholesky
         )
         ll_loss = ll_loss_layer([data, mu, D, gamma, None])
         

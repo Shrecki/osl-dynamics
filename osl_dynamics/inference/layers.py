@@ -1612,11 +1612,12 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
         Keyword arguments to pass to the base class.
     """
 
-    def __init__(self, n_states, epsilon, calculation, **kwargs):
+    def __init__(self, n_states, epsilon, calculation,is_cholesky=False, **kwargs):
         super().__init__(**kwargs)
         self.n_states = n_states
         self.epsilon = epsilon
         self.calculation = calculation
+        self.is_cholesky=is_cholesky
 
     def call(self, inputs, **kwargs):
         x, mu, sigma, probs, session_id = inputs
@@ -1633,9 +1634,15 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
         # Log-likelihood for each state
         ll_loss = tf.zeros(shape=tf.shape(x)[:-1])
         for i in range(self.n_states):
+            if self.is_cholesky:
+                # sigma is already L, use directly!
+                scale_tril = tf.gather(sigma, i, axis=-3)
+            else:
+                # sigma is Σ, compute Cholesky
+                scale_tril = tf.linalg.cholesky(tf.gather(sigma, i, axis=-3))
             mvn = tfp.distributions.MultivariateNormalTriL(
                 loc=tf.gather(mu, i, axis=-2),
-                scale_tril=tf.linalg.cholesky(tf.gather(sigma, i, axis=-3)),
+                scale_tril=scale_tril,
                 allow_nan_stats=False,
             )
             a = mvn.log_prob(x)
