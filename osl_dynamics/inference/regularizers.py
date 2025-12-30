@@ -27,18 +27,20 @@ class LogDiagonalCholeskyPrior(regularizers.Regularizer):
             Standard deviation of the prior.
         """
         self.mu = tf.constant(mu, dtype=tf.float32)     # (D,)
-        self.sigma = float(sigma)
+        self.sigma = tf.constant(sigma, dtype=tf.float32)
         self.epsilon = float(epsilon)
         self.fill = tfb.FillScaleTriL()
 
     def __call__(self, flattened_cholesky_factors):
         # flattened_cholesky_factors: (K, D(D+1)/2)
         L = self.fill(flattened_cholesky_factors)       # (K, D, D)
-
         log_diag = tf.math.log(tf.linalg.diag_part(L))  # (K, D)
-        diff = log_diag - self.mu[None, :]              # broadcast over K
-
-        reg = tf.reduce_sum(diff ** 2) / (2.0 * self.sigma ** 2)
+        diff = log_diag - self.mu[None, :]              # (K, D) - broadcast over K
+        
+        # Channel-specific regularization: divide each channel by its own sigma²
+        # self.sigma is now shape (D,)
+        reg = tf.reduce_sum(diff ** 2 / (2.0 * self.sigma[None, :] ** 2))
+        
         return reg
 
 
