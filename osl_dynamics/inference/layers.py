@@ -242,7 +242,7 @@ class InverseCholeskyLayer(layers.Layer):
 
     def __init__(self, epsilon, **kwargs):
         super().__init__(**kwargs)
-        self.epsilon = epsilon
+        self.epsilon = tf.float32(epsilon)
         self.bijector = tfb.Chain(
             [tfb.CholeskyOuterProduct(), tfb.FillScaleTriL()],
         )
@@ -744,7 +744,7 @@ class CholeskyFactorsLayer(layers.Layer):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.epsilon = epsilon
+        self.epsilon = tf.float32(epsilon)
         
         # Bijector used to transform learnable vectors to Cholesky matrices
         self.bijector = tfb.FillScaleTriL()
@@ -799,17 +799,14 @@ class CholeskyFactorsLayer(layers.Layer):
         learnable_tensor_layer = self.layers[0]
         flattened_cholesky_factors = learnable_tensor_layer(inputs, **kwargs)
     
-        print(f"Flattened Chol: {flattened_cholesky_factors.shape}")
         # Apply bijector first
         L = self.bijector(flattened_cholesky_factors)
         
-        
         # Then ensure positive diagonal on the actual matrix
         diag = tf.linalg.diag_part(L)
-        safe_diag = tf.nn.softplus(diag) + 1e-8
+        safe_diag = tf.nn.softplus(diag) + self.epsilon
         L = tf.linalg.set_diag(L, safe_diag)
         
-        print(f"L: {L.shape}")
         return L
 
 
@@ -1615,9 +1612,6 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
     def call(self, inputs, **kwargs):
         x, mu, sigma, probs, session_id = inputs
         
-        print(f"X shape: {x.shape}")
-        print(f"Probs shape: {probs.shape}")
-
         # Add a small error for numerical stability
         sigma = add_epsilon(sigma, self.epsilon, diag=True)
 
