@@ -383,6 +383,7 @@ class Model(ModelBase):
             occupancies = []
             for element in dataset:
                 x = self._unpack_inputs(element)
+                print(x.shape)
                 # Update state probabilities
                 #start_post = time.time()
                 gamma, xi_sum = self.get_posterior(x)
