@@ -1767,9 +1767,9 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
             
         if self.analytical_gradient:
             if self.calculation == "sum":
-                nll_loss =categorical_nll_sum_custom_grad(x,mu,scale_tril, probs, self.calculation)
+                nll_loss =categorical_nll_sum_custom_grad(x,mu,scale_tril, probs)
             else:
-                nll_loss =categorical_nll_mean_custom_grad(x,mu,scale_tril, probs, self.calculation)
+                nll_loss =categorical_nll_mean_custom_grad(x,mu,scale_tril, probs)
 
         else:
             # Create distribution for all states simultaneously
