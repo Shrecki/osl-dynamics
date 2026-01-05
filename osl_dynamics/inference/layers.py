@@ -1786,6 +1786,24 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
                 allow_nan_stats=False
             )
             
+            # r: (B,T,K,D)
+            r = x[:, :, None, :] - mu[None, None, :, :]
+
+            # solve y for each state
+            B = tf.shape(x)[0]; T = tf.shape(x)[1]; D = tf.shape(x)[2]
+            K = tf.shape(mu)[0]
+
+            r_flat = tf.reshape(r, [-1, D, 1])
+            L_tiled = tf.repeat(L[None, ...], repeats=B*T, axis=0)
+            L_flat = tf.reshape(L_tiled, [-1, D, D])
+
+            y_flat = tf.linalg.triangular_solve(L_flat, r_flat, lower=True)
+            y = tf.reshape(y_flat, [B, T, K, D])
+
+            tf.print("max |y|:", tf.reduce_max(tf.abs(y)))
+            tf.print("max ||y||^2:", tf.reduce_max(tf.reduce_sum(tf.square(y), axis=-1)))
+
+            
             # Compute log_prob for all states at once
             # This broadcasts x across all states
             log_probs = mvn.log_prob(x_expanded)  # (batch, seq_len, n_states)
