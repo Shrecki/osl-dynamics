@@ -1794,7 +1794,7 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
             K = tf.shape(mu)[0]
 
             r_flat = tf.reshape(r, [-1, D, 1])
-            L_tiled = tf.repeat(L[None, ...], repeats=B*T, axis=0)
+            L_tiled = tf.repeat(scale_tril[None, ...], repeats=B*T, axis=0)
             L_flat = tf.reshape(L_tiled, [-1, D, D])
 
             y_flat = tf.linalg.triangular_solve(L_flat, r_flat, lower=True)
