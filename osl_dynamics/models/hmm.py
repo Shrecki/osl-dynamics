@@ -2115,7 +2115,8 @@ class Model(ModelBase):
             config.covariances_epsilon,
             config.loss_calc,
             name="ll_loss",
-            is_cholesky=is_cholesky
+            is_cholesky=is_cholesky,
+            analytical_gradient=is_cholesky # Simply use the analytical gradient in that case
         )
         ll_loss = ll_loss_layer([data, mu, D, gamma, None])
         
