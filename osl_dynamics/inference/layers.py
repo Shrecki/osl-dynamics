@@ -1757,8 +1757,6 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
             sigma = tf.gather(sigma, session_id)
 
 
-        # Log-likelihood for each state
-        x_expanded = tf.expand_dims(x, axis=2)
         # Create batch distribution for ALL states at once
         if self.is_cholesky:
             scale_tril = sigma  # Already (batch, n_states, n_channels, n_channels)
@@ -1772,6 +1770,9 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
                 nll_loss =categorical_nll_mean_custom_grad(x,mu,scale_tril, probs)
 
         else:
+            # Log-likelihood for each state
+            x_expanded = tf.expand_dims(x, axis=2)
+        
             # Create distribution for all states simultaneously
             mvn = tfp.distributions.MultivariateNormalTriL(
                 loc=mu,  # (batch, n_states, n_channels)
@@ -1782,10 +1783,10 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
             # Compute log_prob for all states at once
             # This broadcasts x across all states
             log_probs = mvn.log_prob(x_expanded)  # (batch, seq_len, n_states)
-            
+            tf.debugging.check_numerics(log_probs, "log_probs")
             # Weight by gamma and sum
             ll_loss = tf.reduce_sum(probs * log_probs, axis=-1)  # (batch, seq_len)
-
+            tf.debugging.check_numerics(ll_loss, "ll_loss")
             if self.calculation == "sum":
                 # Sum over time dimension and average over the batch dimension
                 ll_loss = tf.reduce_sum(ll_loss, axis=1)
@@ -1796,6 +1797,7 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
 
             # Add the negative log-likelihood to the loss
             nll_loss = -ll_loss
+            tf.debugging.check_numerics(nll_loss, "nll_loss")
         self.add_loss(nll_loss)
         self.add_metric(nll_loss, name=self.name)
 
