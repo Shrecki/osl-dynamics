@@ -1747,8 +1747,7 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
     def call(self, inputs, **kwargs):
         x, mu, sigma, probs, session_id = inputs
         
-        # Add a small error for numerical stability
-        sigma = add_epsilon(sigma, self.epsilon, diag=True)
+        
 
         if session_id is not None:
             # Get the mean and covariance for the requested array
@@ -1761,6 +1760,8 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
         if self.is_cholesky:
             scale_tril = sigma  # Already (batch, n_states, n_channels, n_channels)
         else:
+            # Add a small error for numerical stability
+            sigma = add_epsilon(sigma, self.epsilon, diag=True)
             scale_tril = tf.linalg.cholesky(sigma)
             
         if self.analytical_gradient:
