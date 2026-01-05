@@ -1589,147 +1589,136 @@ import tensorflow_probability as tfp
 tfd = tfp.distributions
 
 
+import numpy as np
+import tensorflow as tf
+import tensorflow_probability as tfp
+
+tfd = tfp.distributions
+
 @tf.custom_gradient
-def categorical_ll_custom_grad(
-    x,
-    mu,
-    L,
-    gamma,
-    calculation="sum",
-):
-    """
-    Pattern B:
-      - Forward uses TFP MultivariateNormalTriL.log_prob (so your scalar loss matches TFP).
-      - Backward (grad) is custom/analytic and does NOT differentiate through TFP.
-
-    Expected shapes (most common in your setup):
-      x:     (B, T, D)
-      mu:    (K, D)                 (state means)
-      L:     (K, D, D)              (state Cholesky factors, lower-triangular)
-      gamma: (B, T, K)              (responsibilities)
-
-    Notes:
-      - This custom gradient is written to avoid per-sample (B,T,K,D,D) outer-product tensors.
-      - It still forms residuals r of shape (B,T,K,D) (usually unavoidable when broadcasting across K).
-      - It reduces early into sufficient statistics: Nk (K,) and S (K,D,D).
-
-    Returns:
-      nll: scalar (shape ())  -- negative weighted log-likelihood per your reduction
-    """
+def categorical_nll_sum_custom_grad(x, mu, L, gamma):
+    # Forward uses TFP
     x = tf.convert_to_tensor(x, tf.float32)
     mu = tf.convert_to_tensor(mu, tf.float32)
-    L = tf.convert_to_tensor(L, tf.float32)
+    L  = tf.convert_to_tensor(L,  tf.float32)
     gamma = tf.convert_to_tensor(gamma, tf.float32)
 
-    # -------------------------
-    # Forward (TFP)
-    # -------------------------
-    # Broadcast x across states
-    x_expanded = tf.expand_dims(x, axis=2)  # (B, T, 1, D)
+    B = tf.shape(x)[0]
+    T = tf.shape(x)[1]
+    D = tf.shape(x)[2]
+    K = tf.shape(mu)[0]
 
-    mvn = tfd.MultivariateNormalTriL(
-        loc=mu,          # (K, D) -> broadcast to (B,T,K,D) by log_prob
-        scale_tril=L,    # (K, D, D)
-        allow_nan_stats=False,
-    )
+    mvn = tfd.MultivariateNormalTriL(loc=mu, scale_tril=L, allow_nan_stats=False)
+    log_probs = mvn.log_prob(tf.expand_dims(x, 2))  # (B,T,K)
 
-    log_probs = mvn.log_prob(x_expanded)  # (B, T, K)
+    ll_bt = tf.reduce_sum(gamma * log_probs, axis=-1)          # (B,T)
+    ll_scalar = tf.reduce_mean(tf.reduce_sum(ll_bt, axis=1))   # scalar
+    nll = -ll_scalar
 
-    # Weighted log-likelihood per time step
-    ll_bt = tf.reduce_sum(gamma * log_probs, axis=-1)  # (B, T)
+    # norm for gradients: mean over batch after summing time
+    norm = tf.cast(B, tf.float32)
 
-    if calculation == "sum":
-        # Sum over time, average over batch
-        ll_scalar = tf.reduce_mean(tf.reduce_sum(ll_bt, axis=1), axis=0)  # scalar
-        # Normalization used in the gradient so it matches this reduction
-        norm = tf.cast(tf.shape(x)[0], tf.float32)  # B
-    else:
-        # Mean over batch and time
-        ll_scalar = tf.reduce_mean(ll_bt, axis=(0, 1))  # scalar
-        norm = tf.cast(tf.shape(x)[0] * tf.shape(x)[1], tf.float32)  # B*T
-
-    nll = -ll_scalar  # scalar
-
-    # -------------------------
-    # Backward (analytic)
-    # -------------------------
     def grad(dy):
-        """
-        dy: upstream gradient w.r.t. nll (scalar). Usually 1.0.
-        Returns gradients for: (x, mu, L, gamma, calculation)
-        """
         dy = tf.cast(dy, tf.float32)
 
-        # We do not propagate gradients into x or gamma in this setup
-        # (Your model treats x as data and gamma as input.)
-        gx = None
-        ggamma = None
-
-        # ----- Shapes -----
-        # x: (B,T,D), mu: (K,D), L: (K,D,D), gamma: (B,T,K)
-        B = tf.shape(x)[0]
-        T = tf.shape(x)[1]
-        D = tf.shape(x)[2]
-        K = tf.shape(mu)[0]
-
-        # Weighting consistent with the scalar reduction:
-        # nll = -(1/norm) * sum_{b,t,k} gamma * logp  (with t summed or averaged depending on norm)
+        # weights consistent with reduction
         w = gamma / norm  # (B,T,K)
 
-        # Residuals r: (B,T,K,D)
-        r = x[:, :, None, :] - mu[None, None, :, :]
+        # residuals
+        r = x[:, :, None, :] - mu[None, None, :, :]  # (B,T,K,D)
 
-        # Sufficient statistics:
-        # Nk: (K,)
+        # sufficient stats
         Nk = tf.reduce_sum(w, axis=(0, 1))  # (K,)
-        # S_k = sum_{b,t} w_{btk} r r^T  -> (K,D,D)
-        S = tf.einsum("btk,btkd,btkf->kdf", w, r, r)  # (K, D, D)
+        S  = tf.einsum("btk,btkd,btkf->kdf", w, r, r)  # (K,D,D)
 
-        # Compute y = L^{-1} r (triangular solve) without forming (B,T,K,D,D)
-        # Reshape to use triangular_solve: (..., D, D) and (..., D, N)
+        # y = L^{-1} r
         r_flat = tf.reshape(r, [-1, tf.cast(D, tf.int32), 1])  # (B*T*K, D, 1)
-        L_tiled = tf.repeat(L[None, ...], repeats=B * T, axis=0)  # (B*T, K, D, D)
-        L_flat = tf.reshape(L_tiled, [-1, tf.cast(D, tf.int32), tf.cast(D, tf.int32)])  # (B*T*K, D, D)
-
-        y_flat = tf.linalg.triangular_solve(L_flat, r_flat, lower=True)  # (B*T*K, D, 1)
+        L_tiled = tf.repeat(L[None, ...], repeats=B*T, axis=0) # (B*T, K, D, D)
+        L_flat = tf.reshape(L_tiled, [-1, tf.cast(D, tf.int32), tf.cast(D, tf.int32)])
+        y_flat = tf.linalg.triangular_solve(L_flat, r_flat, lower=True)
         y = tf.reshape(y_flat, [B, T, K, -1])  # (B,T,K,D)
 
-        # Compute LinvT = L^{-T}: solve L^T Z = I
-        I = tf.eye(tf.cast(D, tf.int32), dtype=tf.float32)[None, ...]   # (1,D,D)
-        I = tf.repeat(I, repeats=K, axis=0)                              # (K,D,D)
-        LinvT = tf.linalg.triangular_solve(
-            tf.transpose(L, [0, 2, 1]), I, lower=False
-        )  # (K,D,D)
+        # LinvT = L^{-T}
+        I = tf.eye(tf.cast(D, tf.int32), dtype=tf.float32)[None, ...]
+        I = tf.repeat(I, repeats=K, axis=0)
+        LinvT = tf.linalg.triangular_solve(tf.transpose(L, [0,2,1]), I, lower=False)  # (K,D,D)
 
         # u = Sigma^{-1} r = L^{-T} y
         u = tf.einsum("kij,btkj->btki", LinvT, y)  # (B,T,K,D)
 
-        # Gradient w.r.t mu:
-        # d(nll)/dmu_k = - sum_{b,t} w_{btk} * Sigma^{-1} (x - mu_k)
+        # dmu
         gmu = -tf.reduce_sum(w[:, :, :, None] * u, axis=(0, 1))  # (K,D)
 
-        # Gradient w.r.t L using sufficient statistics:
-        # A_k = L^{-1} S_k L^{-T}
-        # Implement: tmp = L^{-1} S, then A = tmp @ LinvT
-        tmp = tf.linalg.triangular_solve(L, S, lower=True)           # (K,D,D)  = L^{-1} S
-        A = tf.linalg.matmul(tmp, LinvT)                             # (K,D,D)  = L^{-1} S L^{-T}
+        # dL using sufficient stats: gL = L^{-T} (Nk I - A), A = L^{-1} S L^{-T}
+        tmp = tf.linalg.triangular_solve(L, S, lower=True)  # (K,D,D)
+        A = tf.linalg.matmul(tmp, LinvT)                    # (K,D,D)
 
-        # gL_k = L^{-T} (Nk I - A_k)
-        I_K = tf.eye(tf.cast(D, tf.int32), dtype=tf.float32)[None, ...]  # (1,D,D)
-        I_K = tf.repeat(I_K, repeats=K, axis=0)                           # (K,D,D)
-        gL = tf.linalg.matmul(LinvT, (Nk[:, None, None] * I_K - A))        # (K,D,D)
-
-        # Respect lower-triangular parameterization (optional but usually correct)
+        I_K = tf.eye(tf.cast(D, tf.int32), dtype=tf.float32)[None, ...]
+        I_K = tf.repeat(I_K, repeats=K, axis=0)
+        gL = tf.linalg.matmul(LinvT, (Nk[:, None, None] * I_K - A))  # (K,D,D)
         gL = tf.linalg.band_part(gL, -1, 0)
 
-        # Apply upstream scalar dy
-        gmu = dy * gmu
-        gL = dy * gL
-
-        # No grad for the python/string argument "calculation"
-        return (gx, gmu, gL, ggamma, None)
+        return (None, dy * gmu, dy * gL, None)
 
     return nll, grad
+
+
+@tf.custom_gradient
+def categorical_nll_mean_custom_grad(x, mu, L, gamma):
+    # Same as above but reduction is mean over (B,T)
+    x = tf.convert_to_tensor(x, tf.float32)
+    mu = tf.convert_to_tensor(mu, tf.float32)
+    L  = tf.convert_to_tensor(L,  tf.float32)
+    gamma = tf.convert_to_tensor(gamma, tf.float32)
+
+    B = tf.shape(x)[0]
+    T = tf.shape(x)[1]
+    D = tf.shape(x)[2]
+    K = tf.shape(mu)[0]
+
+    mvn = tfd.MultivariateNormalTriL(loc=mu, scale_tril=L, allow_nan_stats=False)
+    log_probs = mvn.log_prob(tf.expand_dims(x, 2))  # (B,T,K)
+
+    ll_bt = tf.reduce_sum(gamma * log_probs, axis=-1)     # (B,T)
+    ll_scalar = tf.reduce_mean(ll_bt)                     # scalar
+    nll = -ll_scalar
+
+    norm = tf.cast(B*T, tf.float32)
+
+    def grad(dy):
+        dy = tf.cast(dy, tf.float32)
+        w = gamma / norm
+
+        r = x[:, :, None, :] - mu[None, None, :, :]
+        Nk = tf.reduce_sum(w, axis=(0, 1))
+        S  = tf.einsum("btk,btkd,btkf->kdf", w, r, r)
+
+        r_flat = tf.reshape(r, [-1, tf.cast(D, tf.int32), 1])
+        L_tiled = tf.repeat(L[None, ...], repeats=B*T, axis=0)
+        L_flat = tf.reshape(L_tiled, [-1, tf.cast(D, tf.int32), tf.cast(D, tf.int32)])
+        y_flat = tf.linalg.triangular_solve(L_flat, r_flat, lower=True)
+        y = tf.reshape(y_flat, [B, T, K, -1])
+
+        I = tf.eye(tf.cast(D, tf.int32), dtype=tf.float32)[None, ...]
+        I = tf.repeat(I, repeats=K, axis=0)
+        LinvT = tf.linalg.triangular_solve(tf.transpose(L, [0,2,1]), I, lower=False)
+
+        u = tf.einsum("kij,btkj->btki", LinvT, y)
+
+        gmu = -tf.reduce_sum(w[:, :, :, None] * u, axis=(0, 1))
+
+        tmp = tf.linalg.triangular_solve(L, S, lower=True)
+        A = tf.linalg.matmul(tmp, LinvT)
+
+        I_K = tf.eye(tf.cast(D, tf.int32), dtype=tf.float32)[None, ...]
+        I_K = tf.repeat(I_K, repeats=K, axis=0)
+        gL = tf.linalg.matmul(LinvT, (Nk[:, None, None] * I_K - A))
+        gL = tf.linalg.band_part(gL, -1, 0)
+
+        return (None, dy * gmu, dy * gL, None)
+
+    return nll, grad
+
 
 
 class CategoricalLogLikelihoodLossLayer(layers.Layer):
@@ -1777,7 +1766,11 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
             scale_tril = tf.linalg.cholesky(sigma)
             
         if self.analytical_gradient:
-            nll_loss =categorical_ll_custom_grad(x,mu,scale_tril, probs, self.calculation)
+            if self.calculation == "sum":
+                nll_loss =categorical_nll_sum_custom_grad(x,mu,scale_tril, probs, self.calculation)
+            else:
+                nll_loss =categorical_nll_mean_custom_grad(x,mu,scale_tril, probs, self.calculation)
+
         else:
             # Create distribution for all states simultaneously
             mvn = tfp.distributions.MultivariateNormalTriL(
