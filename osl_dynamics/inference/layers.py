@@ -1781,15 +1781,14 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
         
             # Create distribution for all states simultaneously
             mvn = tfp.distributions.MultivariateNormalTriL(
-                loc=tf.cast(mu, tf.float64),
-                scale_tril=tf.cast(scale_tril, tf.float64),
+                loc=mu,  # (batch, n_states, n_channels)
+                scale_tril=scale_tril,  # (batch, n_states, n_channels, n_channels)
+                allow_nan_stats=False
             )
+            
             # Compute log_prob for all states at once
             # This broadcasts x across all states
-            log_probs = tf.cast(mvn.log_prob(tf.expand_dims(tf.cast(x, tf.float64), 2)), tf.float32)
-
-            
-            #log_probs = mvn.log_prob(x_expanded)  # (batch, seq_len, n_states)
+            log_probs = mvn.log_prob(x_expanded)  # (batch, seq_len, n_states)
             tf.debugging.check_numerics(log_probs, "log_probs")
             # Weight by gamma and sum
             ll_loss = tf.reduce_sum(probs * log_probs, axis=-1)  # (batch, seq_len)
