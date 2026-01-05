@@ -1773,6 +1773,11 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
         else:
             # Log-likelihood for each state
             x_expanded = tf.expand_dims(x, axis=2)
+            
+            diag = tf.linalg.diag_part(scale_tril)
+            tf.debugging.assert_greater(diag, 0.0)
+            upper = scale_tril - tf.linalg.band_part(scale_tril, -1, 0)
+            tf.debugging.assert_near(tf.reduce_max(tf.abs(upper)), 0.0, atol=1e-6)
         
             # Create distribution for all states simultaneously
             mvn = tfp.distributions.MultivariateNormalTriL(
