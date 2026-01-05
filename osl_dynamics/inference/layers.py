@@ -799,13 +799,8 @@ class CholeskyFactorsLayer(layers.Layer):
         learnable_tensor_layer = self.layers[0]
         flattened_cholesky_factors = learnable_tensor_layer(inputs, **kwargs)
     
-        # Apply bijector first
+        # Apply bijector (map Cholesky factors vectorized to D x D shape, with softplus + eps on diagonal)
         L = self.bijector(flattened_cholesky_factors)
-        
-        # Then ensure positive diagonal on the actual matrix
-        diag = tf.linalg.diag_part(L)
-        safe_diag = tf.nn.softplus(diag) + self.epsilon
-        L = tf.linalg.set_diag(L, safe_diag)
         
         return L
 
@@ -1587,6 +1582,156 @@ class CategoricalKLDivergenceLayer(layers.Layer):
         return kl_loss
 
 
+import numpy as np
+import tensorflow as tf
+import tensorflow_probability as tfp
+
+tfd = tfp.distributions
+
+
+@tf.custom_gradient
+def categorical_ll_custom_grad(
+    x,
+    mu,
+    L,
+    gamma,
+    calculation="sum",
+):
+    """
+    Pattern B:
+      - Forward uses TFP MultivariateNormalTriL.log_prob (so your scalar loss matches TFP).
+      - Backward (grad) is custom/analytic and does NOT differentiate through TFP.
+
+    Expected shapes (most common in your setup):
+      x:     (B, T, D)
+      mu:    (K, D)                 (state means)
+      L:     (K, D, D)              (state Cholesky factors, lower-triangular)
+      gamma: (B, T, K)              (responsibilities)
+
+    Notes:
+      - This custom gradient is written to avoid per-sample (B,T,K,D,D) outer-product tensors.
+      - It still forms residuals r of shape (B,T,K,D) (usually unavoidable when broadcasting across K).
+      - It reduces early into sufficient statistics: Nk (K,) and S (K,D,D).
+
+    Returns:
+      nll: scalar (shape ())  -- negative weighted log-likelihood per your reduction
+    """
+    x = tf.convert_to_tensor(x, tf.float32)
+    mu = tf.convert_to_tensor(mu, tf.float32)
+    L = tf.convert_to_tensor(L, tf.float32)
+    gamma = tf.convert_to_tensor(gamma, tf.float32)
+
+    # -------------------------
+    # Forward (TFP)
+    # -------------------------
+    # Broadcast x across states
+    x_expanded = tf.expand_dims(x, axis=2)  # (B, T, 1, D)
+
+    mvn = tfd.MultivariateNormalTriL(
+        loc=mu,          # (K, D) -> broadcast to (B,T,K,D) by log_prob
+        scale_tril=L,    # (K, D, D)
+        allow_nan_stats=False,
+    )
+
+    log_probs = mvn.log_prob(x_expanded)  # (B, T, K)
+
+    # Weighted log-likelihood per time step
+    ll_bt = tf.reduce_sum(gamma * log_probs, axis=-1)  # (B, T)
+
+    if calculation == "sum":
+        # Sum over time, average over batch
+        ll_scalar = tf.reduce_mean(tf.reduce_sum(ll_bt, axis=1), axis=0)  # scalar
+        # Normalization used in the gradient so it matches this reduction
+        norm = tf.cast(tf.shape(x)[0], tf.float32)  # B
+    else:
+        # Mean over batch and time
+        ll_scalar = tf.reduce_mean(ll_bt, axis=(0, 1))  # scalar
+        norm = tf.cast(tf.shape(x)[0] * tf.shape(x)[1], tf.float32)  # B*T
+
+    nll = -ll_scalar  # scalar
+
+    # -------------------------
+    # Backward (analytic)
+    # -------------------------
+    def grad(dy):
+        """
+        dy: upstream gradient w.r.t. nll (scalar). Usually 1.0.
+        Returns gradients for: (x, mu, L, gamma, calculation)
+        """
+        dy = tf.cast(dy, tf.float32)
+
+        # We do not propagate gradients into x or gamma in this setup
+        # (Your model treats x as data and gamma as input.)
+        gx = None
+        ggamma = None
+
+        # ----- Shapes -----
+        # x: (B,T,D), mu: (K,D), L: (K,D,D), gamma: (B,T,K)
+        B = tf.shape(x)[0]
+        T = tf.shape(x)[1]
+        D = tf.shape(x)[2]
+        K = tf.shape(mu)[0]
+
+        # Weighting consistent with the scalar reduction:
+        # nll = -(1/norm) * sum_{b,t,k} gamma * logp  (with t summed or averaged depending on norm)
+        w = gamma / norm  # (B,T,K)
+
+        # Residuals r: (B,T,K,D)
+        r = x[:, :, None, :] - mu[None, None, :, :]
+
+        # Sufficient statistics:
+        # Nk: (K,)
+        Nk = tf.reduce_sum(w, axis=(0, 1))  # (K,)
+        # S_k = sum_{b,t} w_{btk} r r^T  -> (K,D,D)
+        S = tf.einsum("btk,btkd,btkf->kdf", w, r, r)  # (K, D, D)
+
+        # Compute y = L^{-1} r (triangular solve) without forming (B,T,K,D,D)
+        # Reshape to use triangular_solve: (..., D, D) and (..., D, N)
+        r_flat = tf.reshape(r, [-1, tf.cast(D, tf.int32), 1])  # (B*T*K, D, 1)
+        L_tiled = tf.repeat(L[None, ...], repeats=B * T, axis=0)  # (B*T, K, D, D)
+        L_flat = tf.reshape(L_tiled, [-1, tf.cast(D, tf.int32), tf.cast(D, tf.int32)])  # (B*T*K, D, D)
+
+        y_flat = tf.linalg.triangular_solve(L_flat, r_flat, lower=True)  # (B*T*K, D, 1)
+        y = tf.reshape(y_flat, [B, T, K, -1])  # (B,T,K,D)
+
+        # Compute LinvT = L^{-T}: solve L^T Z = I
+        I = tf.eye(tf.cast(D, tf.int32), dtype=tf.float32)[None, ...]   # (1,D,D)
+        I = tf.repeat(I, repeats=K, axis=0)                              # (K,D,D)
+        LinvT = tf.linalg.triangular_solve(
+            tf.transpose(L, [0, 2, 1]), I, lower=False
+        )  # (K,D,D)
+
+        # u = Sigma^{-1} r = L^{-T} y
+        u = tf.einsum("kij,btkj->btki", LinvT, y)  # (B,T,K,D)
+
+        # Gradient w.r.t mu:
+        # d(nll)/dmu_k = - sum_{b,t} w_{btk} * Sigma^{-1} (x - mu_k)
+        gmu = -tf.reduce_sum(w[:, :, :, None] * u, axis=(0, 1))  # (K,D)
+
+        # Gradient w.r.t L using sufficient statistics:
+        # A_k = L^{-1} S_k L^{-T}
+        # Implement: tmp = L^{-1} S, then A = tmp @ LinvT
+        tmp = tf.linalg.triangular_solve(L, S, lower=True)           # (K,D,D)  = L^{-1} S
+        A = tf.linalg.matmul(tmp, LinvT)                             # (K,D,D)  = L^{-1} S L^{-T}
+
+        # gL_k = L^{-T} (Nk I - A_k)
+        I_K = tf.eye(tf.cast(D, tf.int32), dtype=tf.float32)[None, ...]  # (1,D,D)
+        I_K = tf.repeat(I_K, repeats=K, axis=0)                           # (K,D,D)
+        gL = tf.linalg.matmul(LinvT, (Nk[:, None, None] * I_K - A))        # (K,D,D)
+
+        # Respect lower-triangular parameterization (optional but usually correct)
+        gL = tf.linalg.band_part(gL, -1, 0)
+
+        # Apply upstream scalar dy
+        gmu = dy * gmu
+        gL = dy * gL
+
+        # No grad for the python/string argument "calculation"
+        return (gx, gmu, gL, ggamma, None)
+
+    return nll, grad
+
+
 class CategoricalLogLikelihoodLossLayer(layers.Layer):
     """Layer to calculate the log-likelihood loss assuming a categorical model.
 
@@ -1602,12 +1747,13 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
         Keyword arguments to pass to the base class.
     """
 
-    def __init__(self, n_states, epsilon, calculation,is_cholesky=False, **kwargs):
+    def __init__(self, n_states, epsilon, calculation,is_cholesky=False, analytical_gradient=False, **kwargs):
         super().__init__(**kwargs)
         self.n_states = n_states
         self.epsilon = tf.constant(epsilon, dtype=tf.float32)
         self.calculation = calculation
         self.is_cholesky=is_cholesky
+        self.analytical_gradient = analytical_gradient
 
     def call(self, inputs, **kwargs):
         x, mu, sigma, probs, session_id = inputs
@@ -1621,6 +1767,7 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
             mu = tf.gather(mu, session_id)
             sigma = tf.gather(sigma, session_id)
 
+
         # Log-likelihood for each state
         x_expanded = tf.expand_dims(x, axis=2)
         # Create batch distribution for ALL states at once
@@ -1628,114 +1775,38 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
             scale_tril = sigma  # Already (batch, n_states, n_channels, n_channels)
         else:
             scale_tril = tf.linalg.cholesky(sigma)
-        
-        # Create distribution for all states simultaneously
-        mvn = tfp.distributions.MultivariateNormalTriL(
-            loc=mu,  # (batch, n_states, n_channels)
-            scale_tril=scale_tril,  # (batch, n_states, n_channels, n_channels)
-            allow_nan_stats=False
-        )
-        
-        # Compute log_prob for all states at once
-        # This broadcasts x across all states
-        log_probs = mvn.log_prob(x_expanded)  # (batch, seq_len, n_states)
-        
-        # Weight by gamma and sum
-        ll_loss = tf.reduce_sum(probs * log_probs, axis=-1)  # (batch, seq_len)
-
-        if self.calculation == "sum":
-            # Sum over time dimension and average over the batch dimension
-            ll_loss = tf.reduce_sum(ll_loss, axis=1)
-            ll_loss = tf.reduce_mean(ll_loss, axis=0)
+            
+        if self.analytical_gradient:
+            nll_loss =categorical_ll_custom_grad(x,mu,scale_tril, probs, self.calculation)
         else:
-            # Average over time and batches
-            ll_loss = tf.reduce_mean(ll_loss, axis=(0, 1))
-
-        # Add the negative log-likelihood to the loss
-        nll_loss = -ll_loss
-        self.add_loss(nll_loss)
-        self.add_metric(nll_loss, name=self.name)
-
-        return tf.expand_dims(nll_loss, axis=-1)
-    
-class CategoricalLogLikelihoodLossLayerMasked(layers.Layer):
-    """Layer to calculate the log-likelihood loss assuming a categorical model.
-
-    Parameters
-    ----------
-    n_states : int
-        Number of states.
-    epsilon : float
-        Error added to the covariances for numerical stability.
-    calculation : str
-        Operation for reducing the time dimension. Either 'mean' or 'sum'.
-    kwargs : keyword arguments, optional
-        Keyword arguments to pass to the base class.
-    """
-
-    def __init__(self, n_states, epsilon, calculation, **kwargs):
-        super().__init__(**kwargs)
-        self.n_states = n_states
-        self.epsilon = epsilon
-        self.calculation = calculation
-
-    def call(self, inputs, **kwargs):
-        # Expect inputs to be: x, mu, sigma, probs, mask
-        x, mu, sigma, probs, session_id, mask = inputs
-
-        # Add a small error for numerical stability
-        sigma = add_epsilon(sigma, self.epsilon, diag=True)
-
-        if session_id is not None:
-            # Get the mean and covariance for the requested array
-            session_id = tf.cast(session_id, tf.int32)
-            mu = tf.gather(mu, session_id)
-            sigma = tf.gather(sigma, session_id)
-
-        # Log-likelihood for each state
-        ll_loss = tf.zeros(shape=tf.shape(x)[:-1])
-        for i in range(self.n_states):
+            # Create distribution for all states simultaneously
             mvn = tfp.distributions.MultivariateNormalTriL(
-                loc=tf.gather(mu, i, axis=-2),
-                scale_tril=tf.linalg.cholesky(tf.gather(sigma, i, axis=-3)),
-                allow_nan_stats=False,
+                loc=mu,  # (batch, n_states, n_channels)
+                scale_tril=scale_tril,  # (batch, n_states, n_channels, n_channels)
+                allow_nan_stats=False
             )
-            a = mvn.log_prob(x)
-            ll_loss += probs[:, :, i] * a
+            
+            # Compute log_prob for all states at once
+            # This broadcasts x across all states
+            log_probs = mvn.log_prob(x_expanded)  # (batch, seq_len, n_states)
+            
+            # Weight by gamma and sum
+            ll_loss = tf.reduce_sum(probs * log_probs, axis=-1)  # (batch, seq_len)
 
-        # For time points where mask == 0, log-likelihood to be set to 0 (since log(1)=0)
-        # i.e., to contribute nothing.
-        if mask is not None:
-            # Ensure that mask is of type float and broadcastable to ll_loss
-            mask = tf.cast(mask, ll_loss.dtype)
-            mask = tf.squeeze(mask, axis=-1)
-            ll_loss = ll_loss * mask
-
-            # To normalize properly, sum only over valid time points.
             if self.calculation == "sum":
-                total_valid = tf.reduce_sum(mask, axis=1)
                 # Sum over time dimension and average over the batch dimension
-                ll_loss = tf.reduce_sum(ll_loss, axis=1) / (total_valid + 1e-10)
-                ll_loss = tf.reduce_mean(ll_loss, axis=0)
-            else: 
-                # Average over time and batches
-                total_valid = tf.reduce_sum(mask, axis=(0, 1))
-                ll_loss = tf.reduce_sum(ll_loss, axis=(0, 1)) / (total_valid + 1e-10) # To verify, this looks fishy
-        else:
-            # No mask provided: compute as before.
-            if self.calculation == "sum":
                 ll_loss = tf.reduce_sum(ll_loss, axis=1)
                 ll_loss = tf.reduce_mean(ll_loss, axis=0)
             else:
+                # Average over time and batches
                 ll_loss = tf.reduce_mean(ll_loss, axis=(0, 1))
 
-        # The negative log likelihood loss:
-        nll_loss = -ll_loss
+            # Add the negative log-likelihood to the loss
+            nll_loss = -ll_loss
         self.add_loss(nll_loss)
         self.add_metric(nll_loss, name=self.name)
 
         return tf.expand_dims(nll_loss, axis=-1)
-
 
 class CategoricalWishartLogLikelihoodLossLayer(layers.Layer):
     """Layer to calculate the log-likelihood loss assuming a categorical Wishart model.
