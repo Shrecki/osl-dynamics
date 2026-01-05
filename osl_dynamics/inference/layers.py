@@ -1799,6 +1799,7 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
 
             y_flat = tf.linalg.triangular_solve(L_flat, r_flat, lower=True)
             y = tf.reshape(y_flat, [B, T, K, D])
+            tf.debugging.check_numerics(y, "y")
 
             tf.print("max |y|:", tf.reduce_max(tf.abs(y)))
             tf.print("max ||y||^2:", tf.reduce_max(tf.reduce_sum(tf.square(y), axis=-1)))
