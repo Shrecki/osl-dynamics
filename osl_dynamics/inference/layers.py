@@ -33,7 +33,7 @@ def add_epsilon(A, epsilon, diag=False):
     diag : bool, optional
         Do we want to add epsilon to the diagonal only?
     """
-    epsilon = tf.cast(epsilon, dtype=tf.float32)
+    epsilon = tf.cast(epsilon, dtype=epsilon.dtype)
     A_shape = tf.shape(A)
     if diag:
         # Add epsilon to the diagonal only
@@ -1741,7 +1741,7 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
     def __init__(self, n_states, epsilon, calculation,is_cholesky=False, analytical_gradient=False, **kwargs):
         super().__init__(**kwargs)
         self.n_states = n_states
-        self.epsilon = tf.constant(epsilon, dtype=tf.float32)
+        self.epsilon = tf.constant(epsilon, dtype=self.compute_dtype)
         self.calculation = calculation
         self.is_cholesky=is_cholesky
         self.analytical_gradient = analytical_gradient
@@ -1749,8 +1749,6 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
     def call(self, inputs, **kwargs):
         x, mu, sigma, probs, session_id = inputs
         
-        
-
         if session_id is not None:
             # Get the mean and covariance for the requested array
             session_id = tf.cast(session_id, tf.int32)
@@ -1829,7 +1827,7 @@ class CategoricalWishartLogLikelihoodLossLayer(layers.Layer):
     def call(self, inputs, **kwargs):
         x, sigma, probs, session_id = inputs
         
-        print(f"X shape: {x.shape}")
+        #print(f"X shape: {x.shape}")
 
         # Add a small error for numerical stability
         sigma = add_epsilon(sigma, self.epsilon, diag=True)
