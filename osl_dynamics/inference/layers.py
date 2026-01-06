@@ -1763,7 +1763,6 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
             # Add a small error for numerical stability
             sigma = add_epsilon(sigma, self.epsilon, diag=True)
             scale_tril = tf.linalg.cholesky(sigma)
-            
         if self.analytical_gradient:
             if self.calculation == "sum":
                 nll_loss =categorical_nll_sum_custom_grad(x,mu,scale_tril, probs)
@@ -1774,11 +1773,6 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
             # Log-likelihood for each state
             x_expanded = tf.expand_dims(x, axis=2)
             
-            diag = tf.linalg.diag_part(scale_tril)
-            tf.debugging.assert_greater(diag, 0.0)
-            upper = scale_tril - tf.linalg.band_part(scale_tril, -1, 0)
-            tf.debugging.assert_near(tf.reduce_max(tf.abs(upper)), 0.0, atol=1e-6)
-        
             # Create distribution for all states simultaneously
             mvn = tfp.distributions.MultivariateNormalTriL(
                 loc=mu,  # (batch, n_states, n_channels)
@@ -1789,10 +1783,8 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
             # Compute log_prob for all states at once
             # This broadcasts x across all states
             log_probs = mvn.log_prob(x_expanded)  # (batch, seq_len, n_states)
-            tf.debugging.check_numerics(log_probs, "log_probs")
             # Weight by gamma and sum
             ll_loss = tf.reduce_sum(probs * log_probs, axis=-1)  # (batch, seq_len)
-            tf.debugging.check_numerics(ll_loss, "ll_loss")
             if self.calculation == "sum":
                 # Sum over time dimension and average over the batch dimension
                 ll_loss = tf.reduce_sum(ll_loss, axis=1)
@@ -1803,7 +1795,6 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
 
             # Add the negative log-likelihood to the loss
             nll_loss = -ll_loss
-            tf.debugging.check_numerics(nll_loss, "nll_loss")
         self.add_loss(nll_loss)
         self.add_metric(nll_loss, name=self.name)
 

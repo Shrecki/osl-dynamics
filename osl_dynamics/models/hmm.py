@@ -36,7 +36,6 @@ import osl_dynamics.data.tf as dtf
 from osl_dynamics.inference import initializers, modes
 from osl_dynamics.inference.layers import (
     CategoricalLogLikelihoodLossLayer,
-    CategoricalLogLikelihoodLossLayerMasked,
     CovarianceMatricesLayer,
     DiagonalMatricesLayer,
     VectorsLayer,
