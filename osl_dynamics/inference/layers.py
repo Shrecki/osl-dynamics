@@ -1598,10 +1598,11 @@ tfd = tfp.distributions
 @tf.custom_gradient
 def categorical_nll_sum_custom_grad(x, mu, L, gamma):
     # Forward uses TFP
-    x = tf.convert_to_tensor(x, tf.float32)
-    mu = tf.convert_to_tensor(mu, tf.float32)
-    L  = tf.convert_to_tensor(L,  tf.float32)
-    gamma = tf.convert_to_tensor(gamma, tf.float32)
+    dtype = x.dtype
+    x = tf.convert_to_tensor(x, dtype)
+    mu = tf.convert_to_tensor(mu, dtype)
+    L  = tf.convert_to_tensor(L,  dtype)
+    gamma = tf.convert_to_tensor(gamma, dtype)
 
     B = tf.shape(x)[0]
     T = tf.shape(x)[1]
@@ -1616,10 +1617,10 @@ def categorical_nll_sum_custom_grad(x, mu, L, gamma):
     nll = -ll_scalar
 
     # norm for gradients: mean over batch after summing time
-    norm = tf.cast(B, tf.float32)
+    norm = tf.cast(B, dtype)
 
     def grad(dy):
-        dy = tf.cast(dy, tf.float32)
+        dy = tf.cast(dy, dtype)
 
         # weights consistent with reduction
         w = gamma / norm  # (B,T,K)
@@ -1639,7 +1640,7 @@ def categorical_nll_sum_custom_grad(x, mu, L, gamma):
         y = tf.reshape(y_flat, [B, T, K, -1])  # (B,T,K,D)
 
         # LinvT = L^{-T}
-        I = tf.eye(tf.cast(D, tf.int32), dtype=tf.float32)[None, ...]
+        I = tf.eye(tf.cast(D, tf.int32), dtype=dtype)[None, ...]
         I = tf.repeat(I, repeats=K, axis=0)
         LinvT = tf.linalg.triangular_solve(tf.transpose(L, [0,2,1]), I, lower=False)  # (K,D,D)
 
@@ -1653,7 +1654,7 @@ def categorical_nll_sum_custom_grad(x, mu, L, gamma):
         tmp = tf.linalg.triangular_solve(L, S, lower=True)  # (K,D,D)
         A = tf.linalg.matmul(tmp, LinvT)                    # (K,D,D)
 
-        I_K = tf.eye(tf.cast(D, tf.int32), dtype=tf.float32)[None, ...]
+        I_K = tf.eye(tf.cast(D, tf.int32), dtype=dtype)[None, ...]
         I_K = tf.repeat(I_K, repeats=K, axis=0)
         gL = tf.linalg.matmul(LinvT, (Nk[:, None, None] * I_K - A))  # (K,D,D)
         gL = tf.linalg.band_part(gL, -1, 0)
@@ -1666,10 +1667,11 @@ def categorical_nll_sum_custom_grad(x, mu, L, gamma):
 @tf.custom_gradient
 def categorical_nll_mean_custom_grad(x, mu, L, gamma):
     # Same as above but reduction is mean over (B,T)
-    x = tf.convert_to_tensor(x, tf.float32)
-    mu = tf.convert_to_tensor(mu, tf.float32)
-    L  = tf.convert_to_tensor(L,  tf.float32)
-    gamma = tf.convert_to_tensor(gamma, tf.float32)
+    dtype = x.dtype
+    x = tf.convert_to_tensor(x, dtype)
+    mu = tf.convert_to_tensor(mu, dtype)
+    L  = tf.convert_to_tensor(L,  dtype)
+    gamma = tf.convert_to_tensor(gamma, dtype)
 
     B = tf.shape(x)[0]
     T = tf.shape(x)[1]
@@ -1683,10 +1685,10 @@ def categorical_nll_mean_custom_grad(x, mu, L, gamma):
     ll_scalar = tf.reduce_mean(ll_bt)                     # scalar
     nll = -ll_scalar
 
-    norm = tf.cast(B*T, tf.float32)
+    norm = tf.cast(B*T, dtype)
 
     def grad(dy):
-        dy = tf.cast(dy, tf.float32)
+        dy = tf.cast(dy, dtype)
         w = gamma / norm
 
         r = x[:, :, None, :] - mu[None, None, :, :]
@@ -1699,7 +1701,7 @@ def categorical_nll_mean_custom_grad(x, mu, L, gamma):
         y_flat = tf.linalg.triangular_solve(L_flat, r_flat, lower=True)
         y = tf.reshape(y_flat, [B, T, K, -1])
 
-        I = tf.eye(tf.cast(D, tf.int32), dtype=tf.float32)[None, ...]
+        I = tf.eye(tf.cast(D, tf.int32), dtype=dtype)[None, ...]
         I = tf.repeat(I, repeats=K, axis=0)
         LinvT = tf.linalg.triangular_solve(tf.transpose(L, [0,2,1]), I, lower=False)
 
@@ -1710,7 +1712,7 @@ def categorical_nll_mean_custom_grad(x, mu, L, gamma):
         tmp = tf.linalg.triangular_solve(L, S, lower=True)
         A = tf.linalg.matmul(tmp, LinvT)
 
-        I_K = tf.eye(tf.cast(D, tf.int32), dtype=tf.float32)[None, ...]
+        I_K = tf.eye(tf.cast(D, tf.int32), dtype=dtype)[None, ...]
         I_K = tf.repeat(I_K, repeats=K, axis=0)
         gL = tf.linalg.matmul(LinvT, (Nk[:, None, None] * I_K - A))
         gL = tf.linalg.band_part(gL, -1, 0)
