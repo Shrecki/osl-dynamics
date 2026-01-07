@@ -424,7 +424,7 @@ class Model(ModelBase):
                 h = None
                 #end_other = time.time()
                 #start_fit_params = time.time()
-                h = self.model.train_on_batch(x_and_gamma, **kwargs)
+                h = self.model.train_on_batch(x_and_gamma, return_dict=True, **kwargs)
                 #end_fit_params = time.time()
                 
                 #print(f"Posterior compute time: {end_post - start_post}")
@@ -432,7 +432,8 @@ class Model(ModelBase):
                 #print(f"Fit params compute time: {end_fit_params - start_fit_params}")
 
                 # Get new loss
-                l = h.history["loss"][0]
+                l = float(h["loss"])
+                #l = h.history["loss"][0]
                 if np.isnan(l):
                     _logger.error("Training failed!")
                     return
