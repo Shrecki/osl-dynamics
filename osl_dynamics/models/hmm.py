@@ -424,7 +424,7 @@ class Model(ModelBase):
                 h = None
                 #end_other = time.time()
                 #start_fit_params = time.time()
-                h = self.model.train_on_batch(x_and_gamma, epochs=1, verbose=0, **kwargs)
+                h = self.model.train_on_batch(x_and_gamma, verbose=0, **kwargs)
                 #end_fit_params = time.time()
                 
                 #print(f"Posterior compute time: {end_post - start_post}")
