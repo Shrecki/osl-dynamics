@@ -585,6 +585,11 @@ class Model(ModelBase):
         history : history
             The training history of the best initialization.
         """
+        import subprocess
+        import psutil
+        import os
+        process = psutil.Process(os.getpid())
+        
         if n_init is None or n_init == 0:
             _logger.info(
                 "Number of initializations was set to zero. "
@@ -609,6 +614,14 @@ class Model(ModelBase):
         best_loss = np.Inf
         for n in range(n_init):
             _logger.info(f"Initialization {n}")
+            gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
+            gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
+            _logger.info(f"GPU memory used before initialization {n}: {gpu_memory_used} MB")
+            
+            mem_usage_mb = process.memory_info().rss / 1024 / 1024
+            _logger.info(f"Memory usage before initialization {n}: {mem_usage_mb:.2f} MB")
+      
+
             self.reset()
             if take < 1:
                 training_data_subset = training_dataset.take(n_batches)
@@ -624,6 +637,12 @@ class Model(ModelBase):
                 best_loss = loss
                 best_history = history
                 best_weights, best_trans_prob = self.get_weights()
+            gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
+            gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
+            _logger.info(f"GPU memory used after initialization {n}: {gpu_memory_used} MB")
+            mem_usage_mb = process.memory_info().rss / 1024 / 1024
+            _logger.info(f"Memory usage after initialization {n}: {mem_usage_mb:.2f} MB")
+    
 
         if best_loss == np.Inf:
             _logger.error("Initialization failed")
