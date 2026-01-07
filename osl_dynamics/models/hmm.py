@@ -339,8 +339,24 @@ class Model(ModelBase):
             sfreq = dataset.sampling_frequency
         else:
             sfreq = 1.0
-        dataset = self.make_dataset(dataset, shuffle=False, concatenate=True)
+        import subprocess
+        import psutil
+        import os
+        process = psutil.Process(os.getpid())
+        gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
+        gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
+        _logger.info(f"GPU memory used before make dataset: {gpu_memory_used} MB")
         
+        mem_usage_mb = process.memory_info().rss / 1024 / 1024
+        _logger.info(f"Memory usage before make dataset: {mem_usage_mb:.2f} MB")
+    
+        dataset = self.make_dataset(dataset, shuffle=False, concatenate=True)
+        gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
+        gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
+        _logger.info(f"GPU memory used after make dataset: {gpu_memory_used} MB")
+        
+        mem_usage_mb = process.memory_info().rss / 1024 / 1024
+        _logger.info(f"Memory usage after make dataset: {mem_usage_mb:.2f} MB")
         # Set static loss scaling factor (Sets bash size in model)
         self.set_static_loss_scaling_factor(dataset)
         
@@ -431,6 +447,12 @@ class Model(ModelBase):
                             1,
                             values=[("rho", self.rho), ("lr", lr), ("loss", l)],
                         )
+            gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
+            gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
+            _logger.info(f"GPU memory used after single iter: {gpu_memory_used} MB")
+            
+            mem_usage_mb = process.memory_info().rss / 1024 / 1024
+            _logger.info(f"Memory usage after single iter: {mem_usage_mb:.2f} MB")
 
             history["loss"].append(np.mean(loss))
             history["rho"].append(self.rho)
@@ -462,7 +484,12 @@ class Model(ModelBase):
             if stopper.stopped_epoch > 0:
                 print(f"Stopping at epoch {n}")
                 break
-
+            gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
+            gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
+            _logger.info(f"GPU memory used after end of iter: {gpu_memory_used} MB")
+            
+            mem_usage_mb = process.memory_info().rss / 1024 / 1024
+            _logger.info(f"Memory usage after end of iter: {mem_usage_mb:.2f} MB")
         if checkpoint_freq is not None:
             np.save(f"{save_filepath}/trans_prob.npy", self.trans_prob)
 
