@@ -628,7 +628,19 @@ class Model(ModelBase):
             else:
                 training_data_subset = training_dataset
             self.set_random_state_time_course_initialization(training_data_subset)
+            gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
+            gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
+            _logger.info(f"GPU memory used after init of tcs {n}: {gpu_memory_used} MB")
+            mem_usage_mb = process.memory_info().rss / 1024 / 1024
+            _logger.info(f"Memory usage after init of tcs {n}: {mem_usage_mb:.2f} MB")
+    
             history = self.fit(training_data_subset, epochs=n_epochs, **kwargs)
+            gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
+            gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
+            _logger.info(f"GPU memory used after fit {n}: {gpu_memory_used} MB")
+            mem_usage_mb = process.memory_info().rss / 1024 / 1024
+            _logger.info(f"Memory usage after fit {n}: {mem_usage_mb:.2f} MB")
+    
             if history is None:
                 continue
             loss = history["loss"][-1]
