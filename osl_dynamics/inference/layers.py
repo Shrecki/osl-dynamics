@@ -1799,7 +1799,7 @@ class CategoricalLogLikelihoodLossLayer(layers.Layer):
         self.add_metric(nll_loss, name=self.name)
 
         return tf.expand_dims(nll_loss, axis=-1)
-
+    
 class CategoricalWishartLogLikelihoodLossLayer(layers.Layer):
     """Layer to calculate the log-likelihood loss assuming a categorical Wishart model.
 
