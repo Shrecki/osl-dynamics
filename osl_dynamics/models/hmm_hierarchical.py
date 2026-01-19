@@ -46,6 +46,50 @@ import tensorflow_probability as tfp
 tfd = tfp.distributions
 
 
+def sort_and_rowsplit_by_subject(x, gamma, subject_ids):
+    """
+    Flatten (B,T,...) -> (N,...), sort by subject id, and compute row_splits for subject blocks.
+
+    Returns
+    -------
+    unique_subjects : (S,) int32   subjects present in batch, in sorted order
+    row_splits      : (S+1,) int32 ragged row splits into the sorted flattened arrays
+    x_sorted        : (N,D)
+    gamma_sorted    : (N,K)
+    sid_sorted      : (N,)
+    """
+    x = tf.convert_to_tensor(x)
+    gamma = tf.convert_to_tensor(gamma)
+    subject_ids = tf.cast(subject_ids, tf.int32)
+    B = tf.shape(x)[0]
+    T = tf.shape(x)[1]
+    D = tf.shape(x)[2]
+    K = tf.shape(gamma)[2]
+    N = B * T
+    # Flatten
+    x_flat = tf.reshape(x, [N, D])
+    g_flat = tf.reshape(gamma, [N, K])
+    sid_flat = tf.reshape(subject_ids, [N])
+    # Sort by subject id
+    sort_idx = tf.argsort(sid_flat, stable=True)
+    sid_sorted = tf.gather(sid_flat, sort_idx)
+    x_sorted = tf.gather(x_flat, sort_idx)
+    gamma_sorted = tf.gather(g_flat, sort_idx)
+    # Find boundaries where subject id changes
+    change = tf.not_equal(sid_sorted[1:], sid_sorted[:-1])          # (N-1,)
+    boundaries = tf.where(change)[:, 0] + 1                         # positions in 1..N-1
+    row_splits = tf.concat(
+        [
+            tf.zeros([1], dtype=tf.int32),
+            tf.cast(boundaries, tf.int32),
+            tf.reshape(tf.cast(N, tf.int32), [1])
+        ],
+        axis=0
+    )
+    # Unique subjects in the same order as blocks
+    unique_subjects = tf.gather(sid_sorted, row_splits[:-1])
+    return unique_subjects, row_splits, x_sorted, gamma_sorted, sid_sorted
+
 @tf.custom_gradient
 def hierarchical_categorical_nll_mean_custom_grad(
     x, mu_pop, L_pop, mu_subj, L_subj, gamma, subject_ids, lambda_mu, lambda_L, n_subjects
@@ -81,16 +125,13 @@ def hierarchical_categorical_nll_mean_custom_grad(
     total_loss : tf.Tensor
         Scalar loss value.
     """
-    dtype = x.dtype
-    x = tf.convert_to_tensor(x, dtype)
-    mu_pop = tf.convert_to_tensor(mu_pop, dtype)
-    L_pop = tf.convert_to_tensor(L_pop, dtype)
-    mu_subj = tf.convert_to_tensor(mu_subj, dtype)
-    L_subj = tf.convert_to_tensor(L_subj, dtype)
-    gamma = tf.convert_to_tensor(gamma, dtype)
+    dtype = mu_pop.dtype
+    x = tf.cast(x, dtype)
+    gamma = tf.cast(gamma, dtype)
     subject_ids = tf.cast(tf.reshape(subject_ids, [-1]), tf.int32)
     lambda_mu = tf.cast(lambda_mu, dtype)
     lambda_L = tf.cast(lambda_L, dtype)
+
     n_subjects = tf.cast(n_subjects, dtype)
     
     B = tf.shape(x)[0]
@@ -99,257 +140,48 @@ def hierarchical_categorical_nll_mean_custom_grad(
     K = tf.shape(mu_pop)[0]
     P = tf.shape(mu_subj)[0]
     
-    # Get unique subjects in batch
-    unique_subjects, _ = tf.unique(subject_ids)
-    n_unique = tf.cast(tf.shape(unique_subjects)[0], dtype)
     
-    # Gather subject-specific parameters for this batch
-    mu_batch = tf.gather(mu_subj, subject_ids, axis=0)  # (B, K, D)
-    L_batch = tf.gather(L_subj, subject_ids, axis=0)    # (B, K, D, D)
+    # =====================
+    # Sort subjects by their IDs to break into consecutive segments the data (for emission forward, no need to have consecutive samples)
+    # =====================
+    unique_subjects, row_splits, x_sorted, gamma_sorted, _ = sort_and_rowsplit_by_subject(
+        x, gamma, subject_ids
+    )
+
+    N = tf.cast(B*T, dtype)
+    S = tf.shape(unique_subjects)[0]
     
     # =====================
     # Forward pass: compute NLL
     # =====================
+    nll_sum = tf.zeros([], dtype=dtype)  # accumulate total negative log-likelihood numerator
     
-    # Compute log-likelihood using subject-specific parameters
-    # Expand x for broadcasting: (B, T, 1, D)
-    x_expanded = tf.expand_dims(x, axis=2)
-    
-    # Expand parameters: (B, 1, K, D) and (B, 1, K, D, D)
-    mu_expanded = tf.expand_dims(mu_batch, axis=1)
-    L_expanded = tf.expand_dims(L_batch, axis=1)
-    
-    mvn = tfd.MultivariateNormalTriL(
-        loc=mu_expanded,
-        scale_tril=L_expanded,
-        allow_nan_stats=False
-    )
-    
-    log_probs = mvn.log_prob(x_expanded)  # (B, T, K)
-    
-    # Weighted sum over states
-    ll_bt = tf.reduce_sum(gamma * log_probs, axis=-1)  # (B, T)
-    nll = -tf.reduce_mean(ll_bt)  # scalar
-    
-    # =====================
-    # Regularization loss (only for subjects in batch, scaled)
-    # =====================
-    
-    def compute_reg_for_subject(subj_id):
-        mu_s = tf.gather(mu_subj, subj_id, axis=0)  # (K, D)
-        L_s = tf.gather(L_subj, subj_id, axis=0)    # (K, D, D)
-        
-        mu_diff = mu_s - mu_pop
-        L_diff = L_s - L_pop
-        
-        mu_reg = tf.reduce_sum(tf.square(mu_diff))
-        L_reg = tf.reduce_sum(tf.square(L_diff))
-        
-        return mu_reg, L_reg
-    
-    mu_regs, L_regs = tf.map_fn(
-        compute_reg_for_subject,
-        unique_subjects,
-        fn_output_signature=(
-            tf.TensorSpec(shape=(), dtype=dtype),
-            tf.TensorSpec(shape=(), dtype=dtype)
-        )
-    )
-    
-    total_mu_reg = tf.reduce_sum(mu_regs)
-    total_L_reg = tf.reduce_sum(L_regs)
-    
-    # Scale by (n_unique / n_subjects) to normalize
-    scale = n_unique / n_subjects
-    reg_loss = scale * (lambda_mu / 2.0 * total_mu_reg + lambda_L / 2.0 * total_L_reg)
-    
-    total_loss = nll + reg_loss
-    
-    # =====================
-    # Custom gradient
-    # =====================
-    
-    def grad(dy):
-        dy = tf.cast(dy, dtype)
-        
-        # Normalization for mean reduction over (B, T)
-        norm = tf.cast(B * T, dtype)
-        w = gamma / norm  # (B, T, K)
-        
-        # Residuals per batch element: r[b,t,k] = x[b,t] - mu_batch[b,k]
-        r = x[:, :, None, :] - mu_batch[:, None, :, :]  # (B, T, K, D)
-        
-        # Compute L^{-1} r for each batch element
-        # Reshape for batched triangular solve
-        r_flat = tf.reshape(r, [B * T * K, D, 1])
-        L_batch_tiled = tf.tile(L_batch[:, None, :, :, :], [1, T, 1, 1, 1])  # (B, T, K, D, D)
-        L_flat = tf.reshape(L_batch_tiled, [B * T * K, D, D])
-        
-        y_flat = tf.linalg.triangular_solve(L_flat, r_flat, lower=True)
-        y = tf.reshape(y_flat, [B, T, K, D])  # (B, T, K, D)
-        
-        # Compute L^{-T} for each batch element
-        I_eye = tf.eye(D, dtype=dtype)
-        I_batch = tf.tile(I_eye[None, None, :, :], [B, K, 1, 1])  # (B, K, D, D)
-        L_batch_T = tf.transpose(L_batch, [0, 1, 3, 2])  # (B, K, D, D)
-        LinvT_batch = tf.linalg.triangular_solve(L_batch_T, I_batch, lower=False)  # (B, K, D, D)
-        
-        # u = Sigma^{-1} r = L^{-T} L^{-1} r = L^{-T} y
-        u = tf.einsum("bkij,btkj->btki", LinvT_batch, y)  # (B, T, K, D)
-        
-        # =====================
-        # Gradient for mu_subj: accumulate per subject
-        # =====================
-        
-        # Per-batch gradient contribution: -w * u, shape (B, T, K, D)
-        grad_mu_per_sample = -w[:, :, :, None] * u  # (B, T, K, D)
-        
-        # Sum over time: (B, K, D)
-        grad_mu_per_batch = tf.reduce_sum(grad_mu_per_sample, axis=1)
-        
-        # Scatter-add to subject gradients
-        # Initialize gradient tensor for all subjects
-        grad_mu_subj_nll = tf.zeros_like(mu_subj)  # (P, K, D)
-        
-        # Use tensor_scatter_nd_add to accumulate gradients per subject
-        indices = tf.expand_dims(subject_ids, 1)  # (B, 1)
-        grad_mu_subj_nll = tf.tensor_scatter_nd_add(
-            grad_mu_subj_nll, indices, grad_mu_per_batch
-        )
-        
-        # =====================
-        # Gradient for L_subj: accumulate per subject
-        # =====================
-        
-        # Sufficient statistics per batch element
-        # S[b,k] = sum_t w[b,t,k] * r[b,t,k] * r[b,t,k]^T
-        S_batch = tf.einsum("btk,btkd,btkf->bkdf", w, r, r)  # (B, K, D, D)
-        
-        # N[b,k] = sum_t w[b,t,k]
-        Nk_batch = tf.reduce_sum(w, axis=1)  # (B, K)
-        
-        # Compute gradient: tril(L^{-T} (N*I - L^{-1} S L^{-T}))
-        # tmp = L^{-1} S
-        tmp = tf.linalg.triangular_solve(L_batch, S_batch, lower=True)  # (B, K, D, D)
-        # A = tmp @ L^{-T} = L^{-1} S L^{-T}
-        A = tf.matmul(tmp, LinvT_batch)  # (B, K, D, D)
-        
-        I_K = tf.eye(D, dtype=dtype)[None, None, :, :]  # (1, 1, D, D)
-        I_K = tf.tile(I_K, [B, K, 1, 1])  # (B, K, D, D)
-        
-        # gL = L^{-T} @ (Nk * I - A)
-        grad_L_per_batch = tf.matmul(LinvT_batch, Nk_batch[:, :, None, None] * I_K - A)
-        grad_L_per_batch = tf.linalg.band_part(grad_L_per_batch, -1, 0)  # Lower triangular
-        
-        # Scatter-add to subject gradients
-        grad_L_subj_nll = tf.zeros_like(L_subj)  # (P, K, D, D)
-        grad_L_subj_nll = tf.tensor_scatter_nd_add(
-            grad_L_subj_nll, indices, grad_L_per_batch
-        )
-        
-        # =====================
-        # Add regularization gradients (only for subjects in batch)
-        # =====================
-        
-        # Create mask for subjects in batch
-        subject_mask = tf.scatter_nd(
-            tf.expand_dims(unique_subjects, 1),
-            tf.ones_like(unique_subjects, dtype=dtype),
-            [P]
-        )  # (P,) with 1s for present subjects
-        
-        # Gradient from regularization for mu_subj: 
-        # d/d(mu_subj) [lambda_mu/2 * ||mu_subj - mu_pop||^2] = lambda_mu * (mu_subj - mu_pop)
-        # But only for subjects in batch, scaled by (n_unique / n_subjects)
-        reg_scale = scale  # n_unique / n_subjects
-        
-        grad_mu_subj_reg = lambda_mu * (mu_subj - mu_pop[None, :, :])  # (P, K, D)
-        grad_mu_subj_reg = grad_mu_subj_reg * subject_mask[:, None, None]  # mask out absent subjects
-        grad_mu_subj_reg = grad_mu_subj_reg * reg_scale
-        
-        grad_L_subj_reg = lambda_L * (L_subj - L_pop[None, :, :, :])  # (P, K, D, D)
-        grad_L_subj_reg = grad_L_subj_reg * subject_mask[:, None, None, None]
-        grad_L_subj_reg = grad_L_subj_reg * reg_scale
-        
-        # Total subject gradients
-        grad_mu_subj = dy * (grad_mu_subj_nll + grad_mu_subj_reg)
-        grad_L_subj = dy * (grad_L_subj_nll + grad_L_subj_reg)
-        
-        # =====================
-        # Gradient for population parameters
-        # Only from subjects in batch, scaled
-        # =====================
-        
-        # grad w.r.t mu_pop = -lambda_mu * sum_{p in batch} (mu_p - mu_pop) * scale
-        #                   = lambda_mu * sum_{p in batch} (mu_pop - mu_p) * scale
-        mu_diff_masked = (mu_subj - mu_pop[None, :, :]) * subject_mask[:, None, None]
-        grad_mu_pop = -dy * lambda_mu * tf.reduce_sum(mu_diff_masked, axis=0) * reg_scale
-        
-        # grad w.r.t L_pop = -lambda_L * sum_{p in batch} (L_p - L_pop) * scale
-        L_diff_masked = (L_subj - L_pop[None, :, :, :]) * subject_mask[:, None, None, None]
-        grad_L_pop = -dy * lambda_L * tf.reduce_sum(L_diff_masked, axis=0) * reg_scale
-        
-        # Return gradients in same order as inputs
-        # (x, mu_pop, L_pop, mu_subj, L_subj, gamma, subject_ids, lambda_mu, lambda_L, n_subjects)
-        return (None, grad_mu_pop, grad_L_pop, grad_mu_subj, grad_L_subj, None, None, None, None, None)
-    
-    return total_loss, grad
+    def per_subject_ll(i):
+        start = row_splits[i]
+        stop  = row_splits[i + 1]
+        sid   = unique_subjects[i]
 
+        x_block = x_sorted[start:stop]         # (N_i, D)
+        g_block = gamma_sorted[start:stop]     # (N_i, K)
 
-@tf.custom_gradient
-def hierarchical_categorical_nll_sum_custom_grad(
-    x, mu_pop, L_pop, mu_subj, L_subj, gamma, subject_ids, lambda_mu, lambda_L, n_subjects
-):
-    """
-    Same as above but with 'sum' reduction over time (mean over batch only).
-    """
-    dtype = x.dtype
-    x = tf.convert_to_tensor(x, dtype)
-    mu_pop = tf.convert_to_tensor(mu_pop, dtype)
-    L_pop = tf.convert_to_tensor(L_pop, dtype)
-    mu_subj = tf.convert_to_tensor(mu_subj, dtype)
-    L_subj = tf.convert_to_tensor(L_subj, dtype)
-    gamma = tf.convert_to_tensor(gamma, dtype)
-    subject_ids = tf.cast(tf.reshape(subject_ids, [-1]), tf.int32)
-    lambda_mu = tf.cast(lambda_mu, dtype)
-    lambda_L = tf.cast(lambda_L, dtype)
-    n_subjects = tf.cast(n_subjects, dtype)
-    
-    B = tf.shape(x)[0]
-    T = tf.shape(x)[1]
-    D = tf.shape(x)[2]
-    K = tf.shape(mu_pop)[0]
-    P = tf.shape(mu_subj)[0]
-    
-    # Get unique subjects in batch
-    unique_subjects, _ = tf.unique(subject_ids)
-    n_unique = tf.cast(tf.shape(unique_subjects)[0], dtype)
-    
-    # Gather subject-specific parameters for this batch
-    mu_batch = tf.gather(mu_subj, subject_ids, axis=0)  # (B, K, D)
-    L_batch = tf.gather(L_subj, subject_ids, axis=0)    # (B, K, D, D)
-    
-    # =====================
-    # Forward pass: compute NLL
-    # =====================
-    
-    x_expanded = tf.expand_dims(x, axis=2)
-    mu_expanded = tf.expand_dims(mu_batch, axis=1)
-    L_expanded = tf.expand_dims(L_batch, axis=1)
-    
-    mvn = tfd.MultivariateNormalTriL(
-        loc=mu_expanded,
-        scale_tril=L_expanded,
-        allow_nan_stats=False
+        mu_i = tf.gather(mu_subj, sid, axis=0) # (K, D)
+        L_i  = tf.gather(L_subj,  sid, axis=0) # (K, D, D)
+
+        mvn = tfp.distributions.MultivariateNormalTriL(
+            loc=mu_i,
+            scale_tril=L_i,
+            allow_nan_stats=False
+        )
+        logp = mvn.log_prob(x_block[:, None, :])          # (N_i, K)
+
+        # return NEGATIVE contribution (so we can sum directly)
+        return -tf.reduce_sum(g_block * logp)             # scalar
+
+    nll_sum = tf.reduce_sum(
+        tf.map_fn(per_subject_ll, tf.range(S), fn_output_signature=dtype)
     )
     
-    log_probs = mvn.log_prob(x_expanded)  # (B, T, K)
-    ll_bt = tf.reduce_sum(gamma * log_probs, axis=-1)  # (B, T)
-    
-    # Sum over time, mean over batch
-    ll_scalar = tf.reduce_mean(tf.reduce_sum(ll_bt, axis=1))
-    nll = -ll_scalar
-    
+    nll = nll_sum/ N
     # =====================
     # Regularization loss
     # =====================
@@ -375,7 +207,7 @@ def hierarchical_categorical_nll_sum_custom_grad(
     total_mu_reg = tf.reduce_sum(mu_regs)
     total_L_reg = tf.reduce_sum(L_regs)
     
-    scale = n_unique / n_subjects
+    scale = tf.cast(S, dtype) / n_subjects
     reg_loss = scale * (lambda_mu / 2.0 * total_mu_reg + lambda_L / 2.0 * total_L_reg)
     
     total_loss = nll + reg_loss
@@ -386,81 +218,299 @@ def hierarchical_categorical_nll_sum_custom_grad(
     
     def grad(dy):
         dy = tf.cast(dy, dtype)
-        
-        # Normalization: sum over time, mean over batch -> divide by B only
-        norm = tf.cast(B, dtype)
-        w = gamma / norm  # (B, T, K)
-        
-        r = x[:, :, None, :] - mu_batch[:, None, :, :]  # (B, T, K, D)
-        
-        r_flat = tf.reshape(r, [B * T * K, D, 1])
-        L_batch_tiled = tf.tile(L_batch[:, None, :, :, :], [1, T, 1, 1, 1])
-        L_flat = tf.reshape(L_batch_tiled, [B * T * K, D, D])
-        
-        y_flat = tf.linalg.triangular_solve(L_flat, r_flat, lower=True)
-        y = tf.reshape(y_flat, [B, T, K, D])
-        
-        I_eye = tf.eye(D, dtype=dtype)
-        I_batch = tf.tile(I_eye[None, None, :, :], [B, K, 1, 1])
-        L_batch_T = tf.transpose(L_batch, [0, 1, 3, 2])
-        LinvT_batch = tf.linalg.triangular_solve(L_batch_T, I_batch, lower=False)
-        
-        u = tf.einsum("bkij,btkj->btki", LinvT_batch, y)
-        
-        # Gradient for mu_subj
-        grad_mu_per_sample = -w[:, :, :, None] * u
-        grad_mu_per_batch = tf.reduce_sum(grad_mu_per_sample, axis=1)
-        
-        grad_mu_subj_nll = tf.zeros_like(mu_subj)
-        indices = tf.expand_dims(subject_ids, 1)
-        grad_mu_subj_nll = tf.tensor_scatter_nd_add(
-            grad_mu_subj_nll, indices, grad_mu_per_batch
-        )
-        
-        # Gradient for L_subj
-        S_batch = tf.einsum("btk,btkd,btkf->bkdf", w, r, r)
-        Nk_batch = tf.reduce_sum(w, axis=1)
-        
-        tmp = tf.linalg.triangular_solve(L_batch, S_batch, lower=True)
-        A = tf.matmul(tmp, LinvT_batch)
-        
-        I_K = tf.eye(D, dtype=dtype)[None, None, :, :]
-        I_K = tf.tile(I_K, [B, K, 1, 1])
-        
-        grad_L_per_batch = tf.matmul(LinvT_batch, Nk_batch[:, :, None, None] * I_K - A)
-        grad_L_per_batch = tf.linalg.band_part(grad_L_per_batch, -1, 0)
-        
-        grad_L_subj_nll = tf.zeros_like(L_subj)
-        grad_L_subj_nll = tf.tensor_scatter_nd_add(
-            grad_L_subj_nll, indices, grad_L_per_batch
-        )
-        
-        # Regularization gradients
+
+        # Mean over all timepoints => norm = N = B*T
+        # If you want "sum over time, mean over batch", set norm = tf.cast(B, dtype)
+        norm = N
+
+        grad_mu_subj_nll = tf.zeros_like(mu_subj)  # (P,K,D)
+        grad_L_subj_nll  = tf.zeros_like(L_subj)   # (P,K,D,D)
+
+        I = tf.eye(D, dtype=dtype)[None, :, :]     # (1,D,D), will broadcast
+
+        # Loop over unique subjects (handful => OK)
+        # If you later trace this, replace with tf.map_fn over tf.range(S).
+        for i in range(int(unique_subjects.shape[0])):  # eager-friendly
+            start = row_splits[i]
+            stop  = row_splits[i + 1]
+            sid   = unique_subjects[i]  # scalar int32
+
+            x_block = x_sorted[start:stop]         # (N_i, D)
+            g_block = gamma_sorted[start:stop]     # (N_i, K)
+
+            mu_i = tf.gather(mu_subj, sid, axis=0) # (K, D)
+            L_i  = tf.gather(L_subj,  sid, axis=0) # (K, D, D)
+
+            # weights
+            w = g_block / norm                     # (N_i, K)
+
+            # residuals: (N_i, K, D)
+            r = x_block[:, None, :] - mu_i[None, :, :]
+
+            # y = L^{-1} r  -> (N_i, K, D)
+            y = tf.linalg.triangular_solve(L_i[None, ...], r[..., None], lower=True)
+            y = tf.squeeze(y, axis=-1)
+
+            # u = L^{-T} y  -> (N_i, K, D)
+            u = tf.linalg.triangular_solve(
+                tf.linalg.matrix_transpose(L_i)[None, ...],
+                y[..., None],
+                lower=False
+            )
+            u = tf.squeeze(u, axis=-1)
+
+            # ---- mu grad for this subject (K,D)
+            gmu = -tf.einsum("nk,nkd->kd", w, u)  # sum over N_i
+
+            # ---- L grad for this subject (K,D,D)
+            # S_k = sum_n w[n,k] r[n,k] r[n,k]^T
+            S_k = tf.einsum("nk,nkd,nkf->kdf", w, r, r)   # (K,D,D)
+            Nk  = tf.reduce_sum(w, axis=0)                # (K,)
+
+            # LinvT = L^{-T} (K,D,D)
+            LinvT = tf.linalg.triangular_solve(
+                tf.linalg.matrix_transpose(L_i),
+                tf.eye(D, dtype=dtype)[None, :, :],
+                lower=False
+            )  # (K,D,D)
+
+            tmp = tf.linalg.triangular_solve(L_i, S_k, lower=True)  # (K,D,D) = L^{-1} S
+            A   = tf.matmul(tmp, LinvT)                             # (K,D,D) = L^{-1} S L^{-T}
+
+            NI_minus_A = Nk[:, None, None] * I - A                  # (K,D,D)
+            gL = tf.matmul(LinvT, NI_minus_A)                       # (K,D,D)
+            gL = tf.linalg.band_part(gL, -1, 0)                     # keep lower tri
+
+            # scatter-add into full subject tensors
+            idx = tf.reshape(sid, [1, 1])  # shape (1,1)
+            grad_mu_subj_nll = tf.tensor_scatter_nd_add(grad_mu_subj_nll, idx, gmu[None, ...])
+            grad_L_subj_nll  = tf.tensor_scatter_nd_add(grad_L_subj_nll,  idx, gL[None, ...])
+
+        # ---------------------
+        # Regularization grads (same as before)
+        # ---------------------
         subject_mask = tf.scatter_nd(
             tf.expand_dims(unique_subjects, 1),
             tf.ones_like(unique_subjects, dtype=dtype),
             [P]
-        )
-        
+        )  # (P,)
+
         reg_scale = scale
-        
+
         grad_mu_subj_reg = lambda_mu * (mu_subj - mu_pop[None, :, :])
-        grad_mu_subj_reg = grad_mu_subj_reg * subject_mask[:, None, None] * reg_scale
-        
+        grad_mu_subj_reg *= subject_mask[:, None, None] * reg_scale
+
         grad_L_subj_reg = lambda_L * (L_subj - L_pop[None, :, :, :])
-        grad_L_subj_reg = grad_L_subj_reg * subject_mask[:, None, None, None] * reg_scale
-        
+        grad_L_subj_reg *= subject_mask[:, None, None, None] * reg_scale
+
         grad_mu_subj = dy * (grad_mu_subj_nll + grad_mu_subj_reg)
-        grad_L_subj = dy * (grad_L_subj_nll + grad_L_subj_reg)
-        
-        # Population gradients
+        grad_L_subj  = dy * (grad_L_subj_nll  + grad_L_subj_reg)
+
+        # Population grads (from reg only, same as before)
         mu_diff_masked = (mu_subj - mu_pop[None, :, :]) * subject_mask[:, None, None]
         grad_mu_pop = -dy * lambda_mu * tf.reduce_sum(mu_diff_masked, axis=0) * reg_scale
-        
+
         L_diff_masked = (L_subj - L_pop[None, :, :, :]) * subject_mask[:, None, None, None]
         grad_L_pop = -dy * lambda_L * tf.reduce_sum(L_diff_masked, axis=0) * reg_scale
-        
+
         return (None, grad_mu_pop, grad_L_pop, grad_mu_subj, grad_L_subj, None, None, None, None, None)
+    return total_loss, grad
+
+
+@tf.custom_gradient
+def hierarchical_categorical_nll_sum_custom_grad(
+    x, mu_pop, L_pop, mu_subj, L_subj, gamma, subject_ids, lambda_mu, lambda_L, n_subjects
+):
+    """
+    Same as above but with 'sum' reduction over time (mean over batch only).
+    """
+    dtype = mu_pop.dtype
+    x = tf.cast(x, dtype)
+    gamma = tf.cast(gamma, dtype)
+    lambda_mu = tf.cast(lambda_mu, dtype)
+    lambda_L = tf.cast(lambda_L, dtype)
+    n_subjects = tf.cast(n_subjects, dtype)
+    
+    B = tf.shape(x)[0]
+    T = tf.shape(x)[1]
+    D = tf.shape(x)[2]
+    K = tf.shape(mu_pop)[0]
+    P = tf.shape(mu_subj)[0]
+    
+    # =====================
+    # Sort subjects by their IDs to break into consecutive segments the data (for emission forward, no need to have consecutive samples)
+    # =====================
+    unique_subjects, row_splits, x_sorted, gamma_sorted, _ = sort_and_rowsplit_by_subject(
+        x, gamma, subject_ids
+    )
+
+    N = tf.cast(B, dtype)
+    #N = tf.cast(tf.shape(x_sorted)[0], dtype)
+    S = tf.shape(unique_subjects)[0]
+    
+    # =====================
+    # Forward pass: compute NLL
+    # =====================
+    nll_sum = tf.zeros([], dtype=dtype)  # accumulate total negative log-likelihood numerator
+    def per_subject_ll(i):
+        start = row_splits[i]
+        stop  = row_splits[i + 1]
+        sid   = unique_subjects[i]
+
+        x_block = x_sorted[start:stop]         # (N_i, D)
+        g_block = gamma_sorted[start:stop]     # (N_i, K)
+
+        mu_i = tf.gather(mu_subj, sid, axis=0) # (K, D)
+        L_i  = tf.gather(L_subj,  sid, axis=0) # (K, D, D)
+
+        mvn = tfp.distributions.MultivariateNormalTriL(
+            loc=mu_i,
+            scale_tril=L_i,
+            allow_nan_stats=False
+        )
+        logp = mvn.log_prob(x_block[:, None, :])          # (N_i, K)
+
+        # return NEGATIVE contribution (so we can sum directly)
+        return -tf.reduce_sum(g_block * logp)             # scalar
+
+    nll_sum = tf.reduce_sum(
+        tf.map_fn(per_subject_ll, tf.range(S), fn_output_signature=dtype)
+    )
+    
+    nll = nll_sum/ N
+    # =====================
+    # Regularization loss
+    # =====================
+    
+    def compute_reg_for_subject(subj_id):
+        mu_s = tf.gather(mu_subj, subj_id, axis=0)
+        L_s = tf.gather(L_subj, subj_id, axis=0)
+        mu_diff = mu_s - mu_pop
+        L_diff = L_s - L_pop
+        mu_reg = tf.reduce_sum(tf.square(mu_diff))
+        L_reg = tf.reduce_sum(tf.square(L_diff))
+        return mu_reg, L_reg
+    
+    mu_regs, L_regs = tf.map_fn(
+        compute_reg_for_subject,
+        unique_subjects,
+        fn_output_signature=(
+            tf.TensorSpec(shape=(), dtype=dtype),
+            tf.TensorSpec(shape=(), dtype=dtype)
+        )
+    )
+    
+    total_mu_reg = tf.reduce_sum(mu_regs)
+    total_L_reg = tf.reduce_sum(L_regs)
+    
+    scale = tf.cast(S, dtype) / n_subjects
+    reg_loss = scale * (lambda_mu / 2.0 * total_mu_reg + lambda_L / 2.0 * total_L_reg)
+    
+    total_loss = nll + reg_loss
+    
+    # =====================
+    # Custom gradient
+    # =====================
+    
+    def grad(dy):
+        dy = tf.cast(dy, dtype)
+
+        # Mean over all timepoints => norm = N = B*T
+        # If you want "sum over time, mean over batch", set norm = tf.cast(B, dtype)
+        norm = N
+
+        grad_mu_subj_nll = tf.zeros_like(mu_subj)  # (P,K,D)
+        grad_L_subj_nll  = tf.zeros_like(L_subj)   # (P,K,D,D)
+
+        I = tf.eye(D, dtype=dtype)[None, :, :]     # (1,D,D), will broadcast
+
+        # Loop over unique subjects (handful => OK)
+        # If you later trace this, replace with tf.map_fn over tf.range(S).
+        for i in range(int(unique_subjects.shape[0])):  # eager-friendly
+            start = row_splits[i]
+            stop  = row_splits[i + 1]
+            sid   = unique_subjects[i]  # scalar int32
+
+            x_block = x_sorted[start:stop]         # (N_i, D)
+            g_block = gamma_sorted[start:stop]     # (N_i, K)
+
+            mu_i = tf.gather(mu_subj, sid, axis=0) # (K, D)
+            L_i  = tf.gather(L_subj,  sid, axis=0) # (K, D, D)
+
+            # weights
+            w = g_block / norm                     # (N_i, K)
+
+            # residuals: (N_i, K, D)
+            r = x_block[:, None, :] - mu_i[None, :, :]
+
+            # y = L^{-1} r  -> (N_i, K, D)
+            y = tf.linalg.triangular_solve(L_i[None, ...], r[..., None], lower=True)
+            y = tf.squeeze(y, axis=-1)
+
+            # u = L^{-T} y  -> (N_i, K, D)
+            u = tf.linalg.triangular_solve(
+                tf.linalg.matrix_transpose(L_i)[None, ...],
+                y[..., None],
+                lower=False
+            )
+            u = tf.squeeze(u, axis=-1)
+
+            # ---- mu grad for this subject (K,D)
+            gmu = -tf.einsum("nk,nkd->kd", w, u)  # sum over N_i
+
+            # ---- L grad for this subject (K,D,D)
+            # S_k = sum_n w[n,k] r[n,k] r[n,k]^T
+            S_k = tf.einsum("nk,nkd,nkf->kdf", w, r, r)   # (K,D,D)
+            Nk  = tf.reduce_sum(w, axis=0)                # (K,)
+
+            # LinvT = L^{-T} (K,D,D)
+            LinvT = tf.linalg.triangular_solve(
+                tf.linalg.matrix_transpose(L_i),
+                tf.eye(D, dtype=dtype)[None, :, :],
+                lower=False
+            )  # (K,D,D)
+
+            tmp = tf.linalg.triangular_solve(L_i, S_k, lower=True)  # (K,D,D) = L^{-1} S
+            A   = tf.matmul(tmp, LinvT)                             # (K,D,D) = L^{-1} S L^{-T}
+
+            NI_minus_A = Nk[:, None, None] * I - A                  # (K,D,D)
+            gL = tf.matmul(LinvT, NI_minus_A)                       # (K,D,D)
+            gL = tf.linalg.band_part(gL, -1, 0)                     # keep lower tri
+
+            # scatter-add into full subject tensors
+            idx = tf.reshape(sid, [1, 1])  # shape (1,1)
+            grad_mu_subj_nll = tf.tensor_scatter_nd_add(grad_mu_subj_nll, idx, gmu[None, ...])
+            grad_L_subj_nll  = tf.tensor_scatter_nd_add(grad_L_subj_nll,  idx, gL[None, ...])
+
+        # ---------------------
+        # Regularization grads (same as before)
+        # ---------------------
+        subject_mask = tf.scatter_nd(
+            tf.expand_dims(unique_subjects, 1),
+            tf.ones_like(unique_subjects, dtype=dtype),
+            [P]
+        )  # (P,)
+
+        reg_scale = scale
+
+        grad_mu_subj_reg = lambda_mu * (mu_subj - mu_pop[None, :, :])
+        grad_mu_subj_reg *= subject_mask[:, None, None] * reg_scale
+
+        grad_L_subj_reg = lambda_L * (L_subj - L_pop[None, :, :, :])
+        grad_L_subj_reg *= subject_mask[:, None, None, None] * reg_scale
+
+        grad_mu_subj = dy * (grad_mu_subj_nll + grad_mu_subj_reg)
+        grad_L_subj  = dy * (grad_L_subj_nll  + grad_L_subj_reg)
+
+        # Population grads (from reg only, same as before)
+        mu_diff_masked = (mu_subj - mu_pop[None, :, :]) * subject_mask[:, None, None]
+        grad_mu_pop = -dy * lambda_mu * tf.reduce_sum(mu_diff_masked, axis=0) * reg_scale
+
+        L_diff_masked = (L_subj - L_pop[None, :, :, :]) * subject_mask[:, None, None, None]
+        grad_L_pop = -dy * lambda_L * tf.reduce_sum(L_diff_masked, axis=0) * reg_scale
+
+        return (None, grad_mu_pop, grad_L_pop, grad_mu_subj, grad_L_subj, None, None, None, None, None)
+
     
     return total_loss, grad
 

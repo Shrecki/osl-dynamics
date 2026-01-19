@@ -8,12 +8,21 @@ import numpy as np
 import pytest
 import tensorflow as tf
 from numpy.testing import assert_allclose
+import tensorflow as tf
+import tensorflow_probability as tfp
 
 from osl_dynamics.models.hmm_hierarchical import (
     hierarchical_categorical_nll_mean_custom_grad,
     hierarchical_categorical_nll_sum_custom_grad,
     HierarchicalCategoricalLogLikelihoodLossLayer,
+    sort_and_rowsplit_by_subject
 )
+
+def convert_to_dense(grad):
+    """Convert gradient to dense tensor if it's IndexedSlices."""
+    if isinstance(grad, tf.IndexedSlices):
+        return tf.convert_to_tensor(grad)
+    return grad
 
 
 # =============================================================================
@@ -54,7 +63,7 @@ def regularization_only_problem():
     gamma = np.ones((B, T, K), dtype=np.float32) / K
     
     # Both subjects in batch
-    subject_ids = np.array([0, 1], dtype=np.int32)
+    subject_ids = np.array([[0,0], [1,1]], dtype=np.int32)
     
     return {
         'x': x,
@@ -105,7 +114,7 @@ def small_problem():
     gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
     
     # Subject IDs - mix of subjects in batch
-    subject_ids = np.array([0, 1, 0, 2], dtype=np.int32)
+    subject_ids = np.array([[0,0,1,2], [1,1,1,2], [0,0,2,2], [2,2,2,0],[1,0,0,1]], dtype=np.int32).T
     
     lambda_mu = 1.0
     lambda_L = 1.0
@@ -154,7 +163,7 @@ def single_subject_problem():
     gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
     
     # Only subject 1 in this batch
-    subject_ids = np.array([1, 1, 1], dtype=np.int32)
+    subject_ids = np.array([[1,1,1], [1,1,1], [1,1,1],[1,1,1]], dtype=np.int32)
     
     return {
         'x': x,
@@ -282,6 +291,509 @@ def compute_numerical_gradients(problem, calculation='mean', epsilon=1e-5):
         'grad_mu_subj': numerical_gradient(make_loss_fn('mu_subj'), problem['mu_subj'].copy(), epsilon),
         'grad_L_subj': numerical_gradient(make_loss_fn('L_subj'), problem['L_subj'].copy(), epsilon),
     }
+
+##################################################
+# Tests for analytical gradient vs autodiff      #
+##################################################
+tfd = tfp.distributions
+
+class TestSplit:
+    def test_split_identified_uniques_agree(self):
+        np.random.seed(12345)
+        B, T, D, K, P = 5, 10, 16, 8, 4
+        
+        # Create the data
+        
+        x = np.random.randn(B, T, D)
+        gamma_raw = np.random.rand(B, T, K)
+        gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
+        
+        subject_ids = np.random.randint(0, P, size=(B,T)).astype(np.int32)
+        
+        unique_subjects, row_splits, x_sorted, gamma_sorted, sid_sorted = sort_and_rowsplit_by_subject(x, gamma, subject_ids)
+        
+        # Assert all 
+        
+        assert np.all(unique_subjects.shape == np.unique(subject_ids.flatten()).shape)
+        assert np.all(np.sort(np.unique(subject_ids.flatten())) == np.sort(unique_subjects))
+    
+    def test_splits_agree(self):
+        np.random.seed(12345)
+        B, T, D, K, P = 5, 10, 16, 8, 4
+        
+        # Create the data
+        
+        x = np.random.randn(B, T, D)
+        gamma_raw = np.random.rand(B, T, K)
+        gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
+        
+        subject_ids = np.random.randint(0, P, size=(B,T)).astype(np.int32)
+        subject_ids_flat = subject_ids.flatten()
+        unique_subjects, row_splits, x_sorted, gamma_sorted, sid_sorted = sort_and_rowsplit_by_subject(x, gamma, subject_ids)
+        
+        ids_ = np.argsort(subject_ids_flat)
+        sorted_ = subject_ids_flat[ids_]
+        breaks = [0]
+        for i in range(ids_.size-1):
+            if sorted_[i] != sorted_[i+1]:
+                breaks.append(i+1)
+        breaks.append(ids_.size)
+        breaks = np.array(breaks)
+        
+        
+        assert np.all(breaks.shape == row_splits.shape)
+        assert np.all(breaks == row_splits)
+        
+
+class TestAnalyticalVsAutodiff:
+    """Compare our analytical gradients against TensorFlow's autodiff.
+    
+    This creates a reference implementation using standard TF ops and compares
+    the gradients to our custom gradient implementation.
+    """
+    
+    @staticmethod
+    def reference_loss(x, mu_pop, L_pop, mu_subj, L_subj, gamma, subject_ids,
+                   lambda_mu, lambda_L, n_subjects):
+        """Reference implementation that builds the big gathered tensors.
+
+        Intended ONLY for correctness testing vs analytical gradients.
+        """
+        dtype = mu_pop.dtype
+        x = tf.cast(x, dtype)
+        gamma = tf.cast(gamma, dtype)
+        subject_ids = tf.cast(subject_ids, tf.int32)
+
+        B = tf.shape(x)[0]
+        T = tf.shape(x)[1]
+
+        # Unique subjects for scaling (as in your main loss)
+        unique_subjects, _ = tf.unique(tf.reshape(subject_ids, [-1]))
+        n_unique = tf.cast(tf.shape(unique_subjects)[0], dtype)
+        scale = n_unique / tf.cast(n_subjects, dtype)
+
+        # ---- BIG GATHERS (B,T,...) ----
+        # These are the tensors we avoid in the efficient implementation.
+        mu_batch = tf.gather(mu_subj, subject_ids, axis=0)  # (B, T, K, D)
+        L_batch  = tf.gather(L_subj,  subject_ids, axis=0)  # (B, T, K, D, D)
+
+        # NLL
+        mvn = tfd.MultivariateNormalTriL(
+            loc=mu_batch,        # (B,T,K,D)
+            scale_tril=L_batch,  # (B,T,K,D,D)
+            allow_nan_stats=False
+        )
+
+        # x needs to broadcast over K: (B,T,1,D)
+        log_probs = mvn.log_prob(x[:, :, None, :])          # (B, T, K)
+        ll_weighted = tf.reduce_sum(gamma * log_probs, axis=-1)  # (B, T)
+        nll = -tf.reduce_mean(ll_weighted)                  # mean over (B,T)
+
+        # Regularization over subjects present (your original approach)
+        mu_b = tf.gather(mu_subj, unique_subjects, axis=0)  # (S,K,D)
+        L_b  = tf.gather(L_subj,  unique_subjects, axis=0)  # (S,K,D,D)
+
+        mu_reg = tf.reduce_sum(tf.square(mu_b - mu_pop[None, :, :]))
+        L_reg  = tf.reduce_sum(tf.square(L_b  - L_pop[None, :, :, :]))
+
+        reg_loss = scale * (
+            tf.cast(lambda_mu, dtype) * 0.5 * mu_reg +
+            tf.cast(lambda_L,  dtype) * 0.5 * L_reg
+        )
+
+        return nll + reg_loss
+    
+    def test_mu_pop_gradient_vs_autodiff(self, small_problem):
+        """Compare mu_pop gradient: analytical vs autodiff."""
+        # Autodiff reference
+        mu_pop_var = tf.Variable(small_problem['mu_pop'], dtype=tf.float64)
+        
+        with tf.GradientTape() as tape:
+            loss_ref = self.reference_loss(
+                tf.constant(small_problem['x'], dtype=tf.float64),
+                mu_pop_var,
+                tf.constant(small_problem['L_pop'], dtype=tf.float64),
+                tf.constant(small_problem['mu_subj'], dtype=tf.float64),
+                tf.constant(small_problem['L_subj'], dtype=tf.float64),
+                tf.constant(small_problem['gamma'], dtype=tf.float64),
+                tf.constant(small_problem['subject_ids']),
+                small_problem['lambda_mu'],
+                small_problem['lambda_L'],
+                small_problem['n_subjects']
+            )
+        grad_autodiff = convert_to_dense(tape.gradient(loss_ref, mu_pop_var))
+        
+        # Analytical gradient
+        analytical = compute_analytical_gradients(small_problem, 'mean')
+        
+        print("Autodiff grad_mu_pop:\n", grad_autodiff.numpy())
+        print("Analytical grad_mu_pop:\n", analytical['grad_mu_pop'])
+        print("Difference:\n", grad_autodiff.numpy() - analytical['grad_mu_pop'])
+        
+        assert_allclose(
+            analytical['grad_mu_pop'],
+            grad_autodiff.numpy(),
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg="mu_pop gradient mismatch: analytical vs autodiff"
+        )
+    
+    def test_L_pop_gradient_vs_autodiff(self, small_problem):
+        """Compare L_pop gradient: analytical vs autodiff."""
+        L_pop_var = tf.Variable(small_problem['L_pop'], dtype=tf.float64)
+        
+        with tf.GradientTape() as tape:
+            loss_ref = self.reference_loss(
+                tf.constant(small_problem['x'], dtype=tf.float64),
+                tf.constant(small_problem['mu_pop'], dtype=tf.float64),
+                L_pop_var,
+                tf.constant(small_problem['mu_subj'], dtype=tf.float64),
+                tf.constant(small_problem['L_subj'], dtype=tf.float64),
+                tf.constant(small_problem['gamma'], dtype=tf.float64),
+                tf.constant(small_problem['subject_ids']),
+                small_problem['lambda_mu'],
+                small_problem['lambda_L'],
+                small_problem['n_subjects']
+            )
+        grad_autodiff = convert_to_dense(tape.gradient(loss_ref, L_pop_var))
+        
+        analytical = compute_analytical_gradients(small_problem, 'mean')
+        
+        print("Autodiff grad_L_pop:\n", grad_autodiff.numpy())
+        print("Analytical grad_L_pop:\n", analytical['grad_L_pop'])
+        
+        assert_allclose(
+            analytical['grad_L_pop'],
+            grad_autodiff.numpy(),
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg="L_pop gradient mismatch: analytical vs autodiff"
+        )
+    
+    def test_mu_subj_gradient_vs_autodiff(self, small_problem):
+        """Compare mu_subj gradient: analytical vs autodiff."""
+        mu_subj_var = tf.Variable(small_problem['mu_subj'], dtype=tf.float64)
+        
+        with tf.GradientTape() as tape:
+            loss_ref = self.reference_loss(
+                tf.constant(small_problem['x'], dtype=tf.float64),
+                tf.constant(small_problem['mu_pop'], dtype=tf.float64),
+                tf.constant(small_problem['L_pop'], dtype=tf.float64),
+                mu_subj_var,
+                tf.constant(small_problem['L_subj'], dtype=tf.float64),
+                tf.constant(small_problem['gamma'], dtype=tf.float64),
+                tf.constant(small_problem['subject_ids']),
+                small_problem['lambda_mu'],
+                small_problem['lambda_L'],
+                small_problem['n_subjects']
+            )
+        grad_autodiff = convert_to_dense(tape.gradient(loss_ref, mu_subj_var))
+        
+        analytical = compute_analytical_gradients(small_problem, 'mean')
+        
+        print("Autodiff grad_mu_subj:\n", grad_autodiff.numpy())
+        print("Analytical grad_mu_subj:\n", analytical['grad_mu_subj'])
+        
+        assert_allclose(
+            analytical['grad_mu_subj'],
+            grad_autodiff.numpy(),
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg="mu_subj gradient mismatch: analytical vs autodiff"
+        )
+    
+    def test_L_subj_gradient_vs_autodiff(self, small_problem):
+        """Compare L_subj gradient: analytical vs autodiff."""
+        L_subj_var = tf.Variable(small_problem['L_subj'], dtype=tf.float64)
+        
+        with tf.GradientTape() as tape:
+            loss_ref = self.reference_loss(
+                tf.constant(small_problem['x'], dtype=tf.float64),
+                tf.constant(small_problem['mu_pop'], dtype=tf.float64),
+                tf.constant(small_problem['L_pop'], dtype=tf.float64),
+                tf.constant(small_problem['mu_subj'], dtype=tf.float64),
+                L_subj_var,
+                tf.constant(small_problem['gamma'], dtype=tf.float64),
+                tf.constant(small_problem['subject_ids']),
+                small_problem['lambda_mu'],
+                small_problem['lambda_L'],
+                small_problem['n_subjects']
+            )
+        grad_autodiff = convert_to_dense(tape.gradient(loss_ref, L_subj_var))
+        
+        analytical = compute_analytical_gradients(small_problem, 'mean')
+        
+        print("Autodiff grad_L_subj:\n", grad_autodiff.numpy())
+        print("Analytical grad_L_subj:\n", analytical['grad_L_subj'])
+        
+        assert_allclose(
+            analytical['grad_L_subj'],
+            grad_autodiff.numpy(),
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg="L_subj gradient mismatch: analytical vs autodiff"
+        )
+        
+    def test_ll_layer_gradients_vs_autodiff_random(self):
+        np.random.seed(12345)
+        for trial in range(5):  # Run multiple random trials
+            B, T, D, K, P = 32, 256, 16, 8, 4
+            
+            # Create the data
+            
+            x = np.random.randn(B, T, D)
+            mu_pop = np.random.randn(K, D)
+            L_pop = np.zeros((K, D, D))
+            for k in range(K):
+                A = np.random.randn(D, D) * 0.3
+                L_pop[k] = np.linalg.cholesky(A @ A.T + np.eye(D))
+            
+            mu_subj = np.random.randn(P, K, D)
+            L_subj = np.zeros((P, K, D, D))
+            for p in range(P):
+                for k in range(K):
+                    A = np.random.randn(D, D) * 0.3
+                    L_subj[p, k] = np.linalg.cholesky(A @ A.T + np.eye(D))
+            
+            gamma_raw = np.random.rand(B, T, K)
+            gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
+            
+            subject_ids = np.zeros((B,T),dtype=np.int32) #np.randint(0, P, size=(B,T)).astype(np.int32)
+            lambda_mu = np.random.rand() * 2
+            lambda_L = np.random.rand() * 2
+            
+            # Layer implem
+            mu_pop_var = tf.Variable(mu_pop, dtype=tf.float64)
+            L_pop_var = tf.Variable(L_pop, dtype=tf.float64)
+            mu_subj_var = tf.Variable(mu_subj, dtype=tf.float64)
+            L_subj_var = tf.Variable(L_subj, dtype=tf.float64)
+            
+            # Create the layer
+            # Create the layer
+            layer = HierarchicalCategoricalLogLikelihoodLossLayer(
+                n_states=K, 
+                n_subjects=P,
+                epsilon=1e-6,
+                calculation='mean',
+                lambda_mu=lambda_mu,
+                lambda_L=lambda_L,
+            )
+            
+            with tf.GradientTape() as tape:
+                loss_layer = layer([x, mu_pop_var, L_pop_var, mu_subj_var, L_subj_var, gamma, subject_ids])
+                
+            grads_layer = [
+                convert_to_dense(g).numpy() for g in tape.gradient(
+                    loss_layer, 
+                    [mu_pop_var, L_pop_var, mu_subj_var, L_subj_var]
+                )
+            ]
+            
+            # Autodiff implem
+            with tf.GradientTape() as tape2:
+                loss_ref = self.reference_loss(
+                    tf.constant(x, dtype=tf.float64),
+                    mu_pop_var,
+                    L_pop_var,
+                    mu_subj_var,
+                    L_subj_var,
+                    tf.constant(gamma, dtype=tf.float64),
+                    tf.constant(subject_ids),
+                    lambda_mu,
+                    lambda_L,
+                    P
+                )
+            grads_autodiff = [
+                convert_to_dense(g).numpy() for g in tape2.gradient(
+                    loss_ref, 
+                    [mu_pop_var, L_pop_var, mu_subj_var, L_subj_var]
+                )
+            ]
+            
+            # Compare
+            """for name, g_auto, g_anal in zip(
+                ['mu_pop', 'L_pop', 'mu_subj', 'L_subj'],
+                grads_autodiff,
+                grads_layer
+            ):
+                assert_allclose(
+                    g_anal,
+                    g_auto,
+                    rtol=1e-5,
+                    atol=1e-6,
+                    err_msg=f"Trial {trial}: {name} gradient mismatch"
+               y )
+            """
+            # Also verify loss values match
+            assert_allclose(
+                loss_ref.numpy(),
+                loss_layer.numpy(),
+                rtol=1e-9,
+                err_msg=f"Trial {trial}: Loss values don't match"
+            )
+            
+    def test_ll_layer_returns_zero_grad_for_missing_subj(self):
+        np.random.seed(12345)
+        for trial in range(5):  # Run multiple random trials
+            B, T, D, K, P = 64, 512, 32, 8, 4
+            
+            # Create the data
+            
+            x = np.random.randn(B, T, D)
+            mu_pop = np.random.randn(K, D)
+            L_pop = np.zeros((K, D, D))
+            for k in range(K):
+                A = np.random.randn(D, D) * 0.3
+                L_pop[k] = np.linalg.cholesky(A @ A.T + np.eye(D))
+            
+            mu_subj = np.random.randn(P, K, D)
+            L_subj = np.zeros((P, K, D, D))
+            for p in range(P):
+                for k in range(K):
+                    A = np.random.randn(D, D) * 0.3
+                    L_subj[p, k] = np.linalg.cholesky(A @ A.T + np.eye(D))
+            
+            gamma_raw = np.random.rand(B, T, K)
+            gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
+            
+            subject_ids = np.random.randint(0, P, size=(B,T)).astype(np.int32)
+            
+            # Select subject 0 and discard then for the sake of the example
+            rand_subj_discarded = 0#np.random.randint(0,P)
+            subject_ids[subject_ids == rand_subj_discarded] = 1 # Replace them with subject 1
+            
+            lambda_mu = np.random.rand() * 2
+            lambda_L = np.random.rand() * 2
+            
+            # Layer implem
+            mu_pop_var = tf.Variable(mu_pop, dtype=tf.float64)
+            L_pop_var = tf.Variable(L_pop, dtype=tf.float64)
+            mu_subj_var = tf.Variable(mu_subj, dtype=tf.float64)
+            L_subj_var = tf.Variable(L_subj, dtype=tf.float64)
+            
+            # Create the layer
+            layer = HierarchicalCategoricalLogLikelihoodLossLayer(
+                n_states=K, 
+                n_subjects=P,
+                epsilon=1e-6,
+                calculation='mean',
+                lambda_mu=lambda_mu,
+                lambda_L=lambda_L,
+            )
+            
+            with tf.GradientTape() as tape:
+                loss_layer = layer([x, mu_pop_var, L_pop_var, mu_subj_var, L_subj_var, gamma, subject_ids])
+                
+            grads_layer = [
+                convert_to_dense(g).numpy() for g in tape.gradient(
+                    loss_layer, 
+                    [mu_pop_var, L_pop_var, mu_subj_var, L_subj_var]
+                )
+            ]
+            
+            # Verify that gradients for the discarded subject are indeed equal to zero
+            assert_allclose(grads_layer[2][rand_subj_discarded], np.zeros(grads_layer[2][0].shape))
+            assert_allclose(grads_layer[3][rand_subj_discarded], np.zeros(grads_layer[3][0].shape))
+            
+    
+    def test_all_gradients_vs_autodiff_random(self):
+        """Test all gradients with randomly generated parameters."""
+        np.random.seed(12345)
+        
+        for trial in range(5):  # Run multiple random trials
+            B, T, D, K, P = 32, 128, 32, 8, 4
+            
+            x = np.random.randn(B, T, D)
+            mu_pop = np.random.randn(K, D)
+            L_pop = np.zeros((K, D, D))
+            for k in range(K):
+                A = np.random.randn(D, D) * 0.3
+                L_pop[k] = np.linalg.cholesky(A @ A.T + np.eye(D))
+            
+            mu_subj = np.random.randn(P, K, D)
+            L_subj = np.zeros((P, K, D, D))
+            for p in range(P):
+                for k in range(K):
+                    A = np.random.randn(D, D) * 0.3
+                    L_subj[p, k] = np.linalg.cholesky(A @ A.T + np.eye(D))
+            
+            gamma_raw = np.random.rand(B, T, K)
+            gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
+            
+            subject_ids = np.random.randint(0, P, size=(B,T)).astype(np.int32)
+            lambda_mu = np.random.rand() * 2
+            lambda_L = np.random.rand() * 2
+            
+            # Autodiff
+            mu_pop_var = tf.Variable(mu_pop, dtype=tf.float64)
+            L_pop_var = tf.Variable(L_pop, dtype=tf.float64)
+            mu_subj_var = tf.Variable(mu_subj, dtype=tf.float64)
+            L_subj_var = tf.Variable(L_subj, dtype=tf.float64)
+            
+            with tf.GradientTape() as tape:
+                loss_ref = self.reference_loss(
+                    tf.constant(x, dtype=tf.float64),
+                    mu_pop_var,
+                    L_pop_var,
+                    mu_subj_var,
+                    L_subj_var,
+                    tf.constant(gamma, dtype=tf.float64),
+                    tf.constant(subject_ids),
+                    lambda_mu,
+                    lambda_L,
+                    P
+                )
+            grads_autodiff = [
+                convert_to_dense(g).numpy() for g in tape.gradient(
+                    loss_ref, 
+                    [mu_pop_var, L_pop_var, mu_subj_var, L_subj_var]
+                )
+            ]
+            
+            # Analytical
+            with tf.GradientTape() as tape2:
+                tape2.watch([mu_pop_var, L_pop_var, mu_subj_var, L_subj_var])
+                loss_analytical = hierarchical_categorical_nll_mean_custom_grad(
+                    tf.constant(x, dtype=tf.float64),
+                    mu_pop_var,
+                    L_pop_var,
+                    mu_subj_var,
+                    L_subj_var,
+                    tf.constant(gamma, dtype=tf.float64),
+                    tf.constant(subject_ids),
+                    lambda_mu,
+                    lambda_L,
+                    P
+                )
+            grads_analytical = [
+                convert_to_dense(g).numpy() for g in tape2.gradient(
+                    loss_analytical,
+                    [mu_pop_var, L_pop_var, mu_subj_var, L_subj_var]
+                )
+            ]
+            
+            # Compare
+            for name, g_auto, g_anal in zip(
+                ['mu_pop', 'L_pop', 'mu_subj', 'L_subj'],
+                grads_autodiff,
+                grads_analytical
+            ):
+                assert_allclose(
+                    g_anal,
+                    g_auto,
+                    rtol=1e-5,
+                    atol=1e-6,
+                    err_msg=f"Trial {trial}: {name} gradient mismatch"
+                )
+            
+            # Also verify loss values match
+            assert_allclose(
+                loss_analytical.numpy(),
+                loss_ref.numpy(),
+                rtol=1e-10,
+                err_msg=f"Trial {trial}: Loss values don't match"
+            )
+
 
 
 # =============================================================================
@@ -594,6 +1106,7 @@ class TestLayerWrapper:
         _ = layer(inputs)
         
         assert len(layer.losses) > 0, "Layer should add loss"
+
     
     @pytest.mark.parametrize("calculation", ["mean", "sum"])
     def test_layer_gradient_flow(self, small_problem, calculation):
@@ -613,13 +1126,13 @@ class TestLayerWrapper:
         L_subj = tf.Variable(small_problem['L_subj'])
         
         inputs = [
-            tf.constant(small_problem['x']),
+            tf.constant(small_problem['x'],dtype=tf.float32),
             mu_pop,
             L_pop,
             mu_subj,
             L_subj,
-            tf.constant(small_problem['gamma']),
-            tf.constant(small_problem['subject_ids']),
+            tf.constant(small_problem['gamma'],dtype=tf.float32),
+            tf.constant(small_problem['subject_ids'],dtype=tf.float32),
         ]
         
         with tf.GradientTape() as tape:
