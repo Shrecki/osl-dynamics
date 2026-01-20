@@ -52,10 +52,98 @@ EPS = sys.float_info.epsilon
 
 import tensorflow as tf
 @dataclass
-class HierarchicalConfig(Config):
+class HierarchicalConfig(BaseModelConfig):
+    model_name: str = "HierarchicalHMM"
     n_subjects: int = None
     lambda_mu: float = 1.0
     lambda_L: float = 1.0
+    initial_covariances_pop: np.ndarray = None
+    initial_means_pop: np.ndarray = None
+    # Observation model parameters
+    learn_means: bool = None
+    learn_covariances: bool = None
+    initial_means_subj: np.ndarray = None
+    initial_covariances_subj: np.ndarray = None
+    diagonal_covariances: bool = False
+    covariances_epsilon: float = None
+    means_regularizer: tf.keras.regularizers.Regularizer = None
+    covariances_regularizer: tf.keras.regularizers.Regularizer = None
+
+    initial_trans_prob_subj: np.ndarray = None
+    learn_trans_prob: bool = True
+    state_probs_t0_subj: np.ndarray = None
+
+    # Learning rate schedule parameters
+    trans_prob_update_delay: float = 5  # alpha
+    trans_prob_update_forget: float = 0.7  # beta
+    observation_update_decay: float = 0.1
+    
+    # Transition model parameters
+    #kappa: float = 0.0
+    
+    # Use log space or not
+    implementation: str = "log"
+    
+    def __post_init__(self):
+        self.validate_observation_model_parameters()
+        self.validate_trans_prob_parameters()
+        self.validate_dimension_parameters()
+        self.validate_training_parameters()
+
+    def validate_observation_model_parameters(self):
+        if self.learn_means is None or self.learn_covariances is None:
+            raise ValueError("learn_means and learn_covariances must be passed.")
+
+        if self.covariances_epsilon is None:
+            if self.learn_covariances:
+                self.covariances_epsilon = 1e-6
+            else:
+                self.covariances_epsilon = 0.0
+        
+        if self.initial_covariances_pop is not None:
+            K = self.n_states
+
+            covs = self.initial_covariances_pop
+            if covs.shape[0] != K:
+                raise ValueError("initial_covariances_pop should be n_states x D x D")
+        
+        if self.initial_covariances_subj is not None:
+            K = self.n_states
+
+            covs = self.initial_covariances_subj
+            if covs.shape[0] != K:
+                raise ValueError("initial_covariances_subj should be n_states x D x D")
+        else: 
+            self.initial_covariances_subj = [None]*self.n_subjects
+            
+            
+        if self.initial_means_pop is not None:
+            K = self.n_states
+
+            covs = self.initial_means_pop
+            if covs.shape[0] != K:
+                raise ValueError("initial_means_pop should be n_states x D")
+        
+        if self.initial_means_subj is not None:
+            K = self.n_states
+
+            covs = self.initial_means_subj
+            if covs.shape[0] != K:
+                raise ValueError("initial_means_subj should be n_states x D")
+        else: 
+            self.initial_means_subj = [None]*self.n_subjects
+
+    def validate_trans_prob_parameters(self):
+        if self.initial_trans_prob_subj is not None:
+            P = self.initial_trans_prob_subj
+            ns = self.n_subjects
+            K = self.n_states
+            if (not isinstance(P, np.ndarray) or P.ndim != 3 or not(np.all(P.shape == (ns,K,K)))):
+                raise ValueError("initial_trans_prob_subj must be a 3D numpy array of shape n_subjects x n_states x n_states")
+            for s in range(ns):
+                if not all(np.isclose(np.sum(P[s], axis=1), 1)):
+                    raise ValueError(f"rows of initial_trans_prob_subj must sum to one, but failed for subj {s}")
+    
     
     def validate_hierarchical_parameters(self):
         if self.n_subjects is None:
@@ -575,6 +663,7 @@ class HierarchicalCategoricalLogLikelihoodLossLayer(tf.keras.layers.Layer):
         Regularization strength for Cholesky factors.
     """
     
+    
     def __init__(
         self,
         n_states,
@@ -645,6 +734,46 @@ class HierarchicalModel(Model):
 
     config_type = HierarchicalConfig
     
+    def set_trans_prob(self, trans_prob_subj):
+        """Sets the transition probability matrix.
+
+        Parameters
+        ----------
+        trans_prob : np.ndarray
+            State transition probabilities. Shape must be (n_subjects, n_states, n_states).
+        """
+        if trans_prob_subj is None:
+            trans_prob_subj = (
+                np.ones((self.n_subjects, self.config.n_states, self.config.n_states))
+                * 0.1
+                / (self.config.n_states - 1)
+            )
+            for i in range(self.n_subjects):
+                np.fill_diagonal(trans_prob_subj[i], 0.9)
+        self.trans_prob_subj = trans_prob_subj
+        
+        
+    def set_state_probs_t0(self, state_probs_t0_subj):
+        """Set the initial state probabilities.
+
+        Parameters
+        ----------
+        state_probs_t0 : np.ndarray
+            Initial state probabilities. Shape is (n_subjects, n_states,).
+        """
+
+        if state_probs_t0_subj is None:
+            state_probs_t0_subj = np.ones((self.config.n_subjects, self.config.n_states,)) / self.config.n_states
+        self.state_probs_t0_subj = state_probs_t0_subj
+        
+    def build_model(self):
+        """Builds a keras model."""
+        self.model = self._model_structure()
+
+        self.rho = 1
+        self.set_trans_prob(self.config.initial_trans_prob_subj)
+        self.set_state_probs_t0(self.config.state_probs_t0_subj)
+    
     def __init__(self, config):
         super().__init__(config)
         
@@ -703,7 +832,7 @@ class HierarchicalModel(Model):
             config.n_states,
             config.n_channels,
             config.learn_means,
-            config.initial_means,
+            config.initial_means_pop,
             None,  # No regularizer on population params
             name="means_pop",
         )
@@ -716,7 +845,7 @@ class HierarchicalModel(Model):
                     config.n_states,
                     config.n_channels,
                     config.learn_means,
-                    config.initial_means,
+                    config.initial_means_subj[m],
                     None,
                     name=f"means_subj_{m}",
                 )
@@ -738,7 +867,7 @@ class HierarchicalModel(Model):
         # Subject-specific Cholesky factors
         trils_subj_layers = []
         for m in range(config.n_subjects):
-            init_L = tf.linalg.cholesky(tf.convert_to_tensor(config.initial_covariances[m], tf.float32)) if config.initial_covariances is not None and config.initial_covariances[m] is not None else None
+            init_L = tf.linalg.cholesky(tf.convert_to_tensor(config.initial_covariances_subj[m], tf.float32)) if config.initial_covariances_subj is not None and config.initial_covariances_subj[m] is not None else None
             trils_subj_layers.append(
                 CholeskyFactorsLayer(
                     config.n_states,
@@ -786,6 +915,72 @@ class HierarchicalModel(Model):
         model = tf.keras.Model(inputs=inputs, outputs=[ll_loss], name="HierarchicalHMM")
         return model
     
+    def get_means_subj(self, tensor=False):
+        """Get the state means.
+
+        Returns
+        -------
+        means : np.ndarray
+            State means. Shape is (n_states, n_channels).
+        """
+        if tensor:
+            return [obs_mod.get_observation_model_parameter_tensor(self.model, f"means_subj_{m}") for m in range(self.config.n_subjects)]
+        else:
+            return [obs_mod.get_observation_model_parameter(self.model, f"means_subj_{m}") for m in range(self.config.n_subjects)]
+    
+    
+    def get_trils_subj(self, tensor=False):
+        if tensor:
+            return [obs_mod.get_observation_model_parameter_tensor(self.model,f"trils_subj_{m}") for m in range(self.config.n_subjects)]
+        else:    
+            return [obs_mod.get_observation_model_parameter(self.model,f"trils_subj_{m}") for m in range(self.config.n_subjects)]
+        
+    def get_means_pop(self, tensor=False):
+        """Get the state means.
+
+        Returns
+        -------
+        means : np.ndarray
+            State means. Shape is (n_states, n_channels).
+        """
+        if tensor:
+            return obs_mod.get_observation_model_parameter_tensor(self.model, "means_pop")
+        else:
+            return obs_mod.get_observation_model_parameter(self.model, "means_pop")
+    
+    def get_trils_pop(self, tensor=False):
+        if tensor:
+            return obs_mod.get_observation_model_parameter_tensor(self.model,"trils_pop")
+        else:    
+            return obs_mod.get_observation_model_parameter(self.model,"trils_pop")
+        
+    
+    def get_log_likelihood_graph_hierarchical(self, means_subj, means_pop, trils_subj, trils_pop, data):
+        pass
+    
+    def get_log_likelihood_hierarchical(self, data, subject_ids):
+        r"""Get the log-likelihood of data, :math:`\log p(x_t | s_t)`.
+
+        Parameters
+        ----------
+        data : np.ndarray
+            Data. Shape is (batch_size, ..., n_channels).
+
+        Returns
+        -------
+        log_likelihood : np.ndarray
+            Log-likelihood. Shape is (batch_size, ..., n_states)"""
+        #data = tf.convert_to_tensor(data, dtype=tf.float32)
+        assert tf.is_tensor(data)
+        
+        # Get all parameters (population + subjects)
+        means_subj = self.get_means_subj(tensor=True)
+        means_pop = self.get_means_pop(tensor=True)
+        
+        L_subj = self.get_trils_subj(tensor=True)
+        L_pop = self.get_trils_pop(tensor=True)
+        
+        return self.get_log_likelihood_graph_hierarchical(means_subj, means_pop, L_subj, L_pop,data).numpy()
     
     def get_posterior(self, x, subj_ids):
         """Get marginal and joint posterior.
@@ -796,6 +991,7 @@ class HierarchicalModel(Model):
             Observed data. Shape is (batch_size, sequence_length, n_channels).
         subj_ids: np.ndarray
             IDs of subjects, indicating which are present for hierarchical modeling. Shape is (batch_size, sequence_length,1).
+            IDs of subjects are between 0 and P-1 (inclusive).
 
         Returns
         -------
@@ -805,26 +1001,15 @@ class HierarchicalModel(Model):
         xi : np.ndarray
             Joint posterior distribution of hidden states at two consecutive
             time points, :math:`q(s_t, s_{t+1})`. Shape is
-            (batch_size*sequence_length-1, n_states*n_states).
+            (P, batch_size*sequence_length-1, n_states*n_states).
         """
+        #subj_ids = subj_ids.astype(np.uint32) # Ensure we don't get negatives here
         P_subjs = self.trans_prob_subj
         Pi_0_subjs = self.state_probs_t0_subj
-        #import time
-
-        if self.config.implementation == "log":
-            #start_ll = time.time()
-            log_B = self.get_log_likelihood(x, subj_ids)
-            #end_ll = time.time()
-            #start_bw = time.time()
-            batch_size, sequence_length, n_states = log_B.shape
-            log_B = log_B.transpose(2, 0, 1).reshape(n_states, -1).T
-            gamma, xi = self.baum_welch_log_optimized_hierarchical(log_B, Pi_0_subjs, P_subjs, subj_ids)
-            #end_bw = time.time()
-            #print(f"LL compute time: {end_ll - start_ll}")
-            #print(f"BW compute time: {end_bw - start_bw}")
-        else:
-            B = self.get_likelihood(x, subj_ids)            
-            gamma, xi = self.baum_welch_hierarchical(B, Pi_0_subjs, P_subjs,subj_ids)
+        log_B = self.get_log_likelihood_hierarchical(x, subj_ids)
+        batch_size, sequence_length, n_states = log_B.shape
+        log_B = log_B.transpose(2, 0, 1).reshape(n_states, -1).T
+        gamma, xi = self.baum_welch_log_optimized_hierarchical(log_B, Pi_0_subjs, P_subjs, subj_ids)
         return gamma,xi
     
     @numba.jit
@@ -839,12 +1024,43 @@ class HierarchicalModel(Model):
         
         # Get xi_sum DIRECTLY
         log_xi_sum = _hmmc.compute_log_xi_sum_hierarchical(fwdlattice, P_subjs, bwdlattice, log_B,subj_ids)
-        xi_sum = np.exp(log_xi_sum)  # Shape: (6, 6)
+        xi_sum = np.exp(log_xi_sum)  # Shape: (N_subj, K, K)
         
-        # Reshape to match expected format
-        xi_sum_flat = xi_sum.T.flatten()  # Shape: (36,)
+        N_subj = xi_sum.shape[0]
+        
+        # Reshape to match expected format: (N_subj, K*K)
+        xi_sum_flat = np.swapaxes(xi_sum, 1, 2).reshape((N_subj, -1))
         
         return gamma, xi_sum_flat
+    
+    def row_normalize(self, mat, eps=1e-300):
+        mat = np.asarray(mat)
+        s = mat.sum(axis=-1, keepdims=True)
+        return mat / np.maximum(s, eps)
+    
+ 
+    def update_trans_prob_optimized_hierarchical(self, gamma, xi_sum_flat,subj_ids):
+        """Updated to work with pre-summed xi."""
+        
+        same_next = (subj_ids[:-1] == subj_ids[1:])          # shape (N-1,)
+        K = self.config.n_states
+        for p in range(self.config.n_subjects):
+            if(np.all(xi_sum_flat[p]==0)):
+                continue # We can't update this subject: empty transition counts everywhere
+            else:
+                p_mask = (subj_ids[:-1] == p) & same_next
+                # xi_sum_flat is already summed over time, just reshape
+                xi_p = xi_sum_flat[p].reshape(K, K).T            # (K,K)
+                denom = gamma[:-1][p_mask].sum(axis=0)           # (K,)
+
+                phi_interim = (xi_p + EPS) / (denom[:, None] + K * EPS)  # (K,K), row-wise normalization “in expectation”
+                # Ensure exact row stochastic
+                phi_interim /= phi_interim.sum(axis=1, keepdims=True)
+
+                
+                # Stochastic update of transition matrix
+                self.trans_prob[p] = (1 - self.rho) * self.trans_prob[p] + self.rho * phi_interim
+                self.trans_prob[p] /= self.trans_prob[p].sum(axis=1, keepdims=True)
     
     def fit(
         self,
@@ -980,20 +1196,20 @@ class HierarchicalModel(Model):
             loss = []
             occupancies = []
             for element in dataset:
-                x = self._unpack_inputs(element)
-                subj_ids = x[:,-1]
-                x = x[:,:-1]
+                x_tot = self._unpack_inputs(element)
+                subj_ids = tf.cast(x_tot[:,-1], tf.uint32) # Cast to unsigned int 32
+                x = x_tot[:,:-1]
                 
                 # Get the gamma tcs, which must account for subject IDs
                 gamma, xi_sum = self.get_posterior(x,subj_ids)
 
                 # Update transition probability matrix
                 if self.config.learn_trans_prob:
-                    self.update_trans_prob_optimized(gamma, xi_sum)
+                    self.update_trans_prob_optimized_hierarchical(gamma, xi_sum, subj_ids)
 
                 # Calculate fractional occupancy
-                stc = modes.argmax_time_courses(gamma)
-                occupancies.append(np.sum(stc, axis=0))
+                #stc = modes.argmax_time_courses(gamma)
+                #occupancies.append(np.sum(stc, axis=0))
 
                 # Reshape gamma: (batch_size*sequence_length, n_states)
                 # -> (batch_size, sequence_length, n_states)
@@ -1008,7 +1224,10 @@ class HierarchicalModel(Model):
                 h = None
                 #end_other = time.time()
                 #start_fit_params = time.time()
-                h = self.model.train_on_batch(x_and_gamma, return_dict=True, **kwargs)
+                h = self.model.train_on_batch({
+                        'data_inputs': x_and_gamma,
+                        'subject_id_inputs': subj_ids,  # Shape (B, T)
+                    }, return_dict=True, **kwargs)
                 #end_fit_params = time.time()
                 
                 #print(f"Posterior compute time: {end_post - start_post}")
