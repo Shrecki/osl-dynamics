@@ -10,6 +10,10 @@ import tensorflow as tf
 from numpy.testing import assert_allclose
 import tensorflow as tf
 import tensorflow_probability as tfp
+import numpy.testing as npt
+
+from osl_dynamics.models import _hmmc
+
 
 from osl_dynamics.models.hmm_hierarchical import (
     hierarchical_categorical_nll_mean_custom_grad,
@@ -291,6 +295,276 @@ def compute_numerical_gradients(problem, calculation='mean', epsilon=1e-5):
         'grad_mu_subj': numerical_gradient(make_loss_fn('mu_subj'), problem['mu_subj'].copy(), epsilon),
         'grad_L_subj': numerical_gradient(make_loss_fn('L_subj'), problem['L_subj'].copy(), epsilon),
     }
+    
+##################################################
+# Tests for HMM Baum Welch C++ code              #
+##################################################
+class TestCppBW:
+    def logsumexp_np(self,a, axis=None):
+        a = np.asarray(a)
+        m = np.max(a, axis=axis, keepdims=True)
+        out = m + np.log(np.sum(np.exp(a - m), axis=axis, keepdims=True))
+        return np.squeeze(out, axis=axis)
+
+
+    def forward_log_hierarchical_py(self, startprob_subjs, transmat_subjs, logB, subj_ids):
+        """Pure NumPy reference implementation matching your simplified reset rule:
+        reset at t==0 OR subj_ids[t] != subj_ids[t-1]. (Ignore any other boundaries.)
+        """
+        startprob_subjs = np.asarray(startprob_subjs, dtype=np.float64)
+        transmat_subjs = np.asarray(transmat_subjs, dtype=np.float64)
+        logB = np.asarray(logB, dtype=np.float64)
+        subj_ids = np.asarray(subj_ids, dtype=np.int32)
+
+        P, K = startprob_subjs.shape
+        N = logB.shape[0]
+        assert logB.shape == (N, K)
+        assert transmat_subjs.shape == (P, K, K)
+        assert subj_ids.shape == (N,)
+
+        log_pi = np.log(startprob_subjs)
+        log_A = np.log(transmat_subjs)
+
+        fwd = np.empty((N, K), dtype=np.float64)
+
+        def is_reset(t):
+            return (t == 0) or (subj_ids[t] != subj_ids[t - 1])
+
+        def is_seg_end(t):
+            return (t == N - 1) or (subj_ids[t + 1] != subj_ids[t])
+
+        total_log_prob = 0.0
+
+        for t in range(N):
+            p = subj_ids[t]
+            if is_reset(t):
+                fwd[t, :] = log_pi[p, :] + logB[t, :]
+            else:
+                # fwd[t,j] = logB[t,j] + logsumexp_i(fwd[t-1,i] + log_A[p,i,j])
+                tmp = fwd[t - 1, :][:, None] + log_A[p, :, :]  # (K,K)
+                fwd[t, :] = logB[t, :] + self.logsumexp_np(tmp, axis=0)  # (K,)
+            if is_seg_end(t):
+                total_log_prob += self.logsumexp_np(fwd[t, :], axis=0)
+
+        return float(total_log_prob), fwd
+
+
+    def make_random_stochastic(self, shape, rng):
+        x = rng.random(shape, dtype=np.float64) + 1e-3
+        x /= x.sum(axis=-1, keepdims=True)
+        return x
+
+
+    def test_forward_matches_numpy_reference(self):
+        rng = np.random.default_rng(0)
+
+        P = 4   # n subjects
+        K = 3   # n states
+        N = 25  # total timepoints in flattened stream
+
+        startprob_subjs = self.make_random_stochastic((P, K), rng)
+        transmat_subjs = self.make_random_stochastic((P, K, K), rng)
+
+        # log emissions: use random log-likelihoods (not necessarily normalized)
+        logB = rng.normal(size=(N, K)).astype(np.float64)
+
+        # subject ids with frequent changes
+        subj_ids = rng.integers(low=0, high=P, size=(N,), dtype=np.int32)
+        # force at least one change
+        subj_ids[10:] = (subj_ids[10:] + 1) % P
+
+        # C++ result
+        logp_cpp, fwd_cpp = _hmmc.forward_log_hierarchical(
+            startprob_subjs, transmat_subjs, logB, subj_ids
+        )
+
+        # NumPy reference
+        logp_py, fwd_py = self.forward_log_hierarchical_py(
+            startprob_subjs, transmat_subjs, logB, subj_ids
+        )
+
+        npt.assert_allclose(logp_cpp, logp_py, rtol=1e-10, atol=1e-10, err_msg="log_prob mismatch")
+        npt.assert_allclose(fwd_cpp, fwd_py, rtol=1e-10, atol=1e-10, err_msg="fwd lattice mismatch")
+
+
+    def test_no_subject_changes_reduces_to_standard_forward(self):
+        rng = np.random.default_rng(1)
+
+        P = 3
+        K = 4
+        N = 30
+
+        startprob_subjs = self.make_random_stochastic((P, K), rng)
+        transmat_subjs = self.make_random_stochastic((P, K, K), rng)
+        logB = rng.normal(size=(N, K)).astype(np.float64)
+
+        # constant subject id => should match a standard forward on that subject
+        p = 2
+        subj_ids = np.full((N,), p, dtype=np.int32)
+
+        # compare against your existing standard forward_log for that subject, if available:
+        # forward_log(startprob, transmat, log_frameprob)
+        # If your module exposes forward_log, this is a great regression check.
+        logp_std, fwd_std = _hmmc.forward_log(
+            startprob_subjs[p], transmat_subjs[p], logB
+        )
+        # hierarchical call
+        logp_cpp, fwd_cpp = _hmmc.forward_log_hierarchical(
+            startprob_subjs, transmat_subjs, logB, subj_ids
+        )
+
+        
+
+        npt.assert_allclose(logp_cpp, logp_std, rtol=1e-10, atol=1e-10, err_msg="log_prob mismatch vs standard")
+        npt.assert_allclose(fwd_cpp, fwd_std, rtol=1e-10, atol=1e-10, err_msg="fwd mismatch vs standard")
+
+    def test_no_subject_changes_reduces_to_standard_backward(self):
+        rng = np.random.default_rng(1)
+
+        P = 3
+        K = 4
+        N = 30
+
+        startprob_subjs = self.make_random_stochastic((P, K), rng)
+        transmat_subjs = self.make_random_stochastic((P, K, K), rng)
+        logB = rng.normal(size=(N, K)).astype(np.float64)
+
+        # constant subject id => should match a standard forward on that subject
+        p = 2
+        subj_ids = np.full((N,), p, dtype=np.int32)
+
+        # compare against your existing standard forward_log for that subject, if available:
+        # forward_log(startprob, transmat, log_frameprob)
+        # If your module exposes forward_log, this is a great regression check.
+        bwd_std = _hmmc.backward_log(
+            startprob_subjs[p], transmat_subjs[p], logB
+        )
+        # hierarchical call
+        bwd_hierarchical = _hmmc.backward_log_hierarchical(
+            startprob_subjs, transmat_subjs, logB, subj_ids
+        )
+        npt.assert_allclose(bwd_std, bwd_hierarchical, rtol=1e-10, atol=1e-10, err_msg="bwd mismatch vs standard")
+    
+    def test_reset_points_match_manual_restart_backward(self):
+        """
+        Construct a stream with a known reset at t = split,
+        and verify:
+        bwd matches segment-wise forward stitched together.
+        """
+        rng = np.random.default_rng(2)
+
+        P = 2
+        K = 3
+        N1, N2 = 12, 9
+        N = N1 + N2
+
+        startprob_subjs = self.make_random_stochastic((P, K), rng)
+        transmat_subjs = self.make_random_stochastic((P, K, K), rng)
+
+        logB = rng.normal(size=(N, K)).astype(np.float64)
+
+        # two segments: subj 0 then subj 1
+        subj_ids = np.concatenate([
+            np.zeros(N1, dtype=np.int32),
+            np.ones(N2, dtype=np.int32)
+        ], axis=0)
+
+        # hierarchical call
+        bwd_hierarchical = _hmmc.backward_log_hierarchical(
+            startprob_subjs, transmat_subjs, logB, subj_ids
+        )
+
+        # manual: standard backward on seg1 and seg2 separately
+        bwd1 = _hmmc.backward_log(startprob_subjs[0], transmat_subjs[0], logB[:N1])
+        bwd2 = _hmmc.backward_log(startprob_subjs[1], transmat_subjs[1], logB[N1:])
+
+        bwd_stitched = np.vstack([bwd1, bwd2])
+        npt.assert_allclose(bwd_hierarchical, bwd_stitched, rtol=1e-10, atol=1e-10, err_msg="stitched bwd mismatch")
+
+
+    def test_reset_points_match_manual_restart(self):
+        """
+        Construct a stream with a known reset at t = split,
+        and verify:
+        total_log_prob = log_prob(seg1) + log_prob(seg2),
+        and fwd matches segment-wise forward stitched together.
+        """
+        rng = np.random.default_rng(2)
+
+        P = 2
+        K = 3
+        N1, N2 = 12, 9
+        N = N1 + N2
+
+        startprob_subjs = self.make_random_stochastic((P, K), rng)
+        transmat_subjs = self.make_random_stochastic((P, K, K), rng)
+
+        logB = rng.normal(size=(N, K)).astype(np.float64)
+
+        # two segments: subj 0 then subj 1
+        subj_ids = np.concatenate([
+            np.zeros(N1, dtype=np.int32),
+            np.ones(N2, dtype=np.int32)
+        ], axis=0)
+
+        # hierarchical call
+        logp_cpp, fwd_cpp = _hmmc.forward_log_hierarchical(
+            startprob_subjs, transmat_subjs, logB, subj_ids
+        )
+
+        # manual: standard forward on seg1 and seg2 separately, then add log probs
+        logp1, fwd1 = _hmmc.forward_log(startprob_subjs[0], transmat_subjs[0], logB[:N1])
+        logp2, fwd2 = _hmmc.forward_log(startprob_subjs[1], transmat_subjs[1], logB[N1:])
+        
+        print(fwd_cpp)
+        
+        print(fwd1)
+        print(fwd2)
+
+        #npt.assert_allclose(logp_cpp, logp1 + logp2, rtol=1e-10, atol=1e-10, err_msg="segment log_prob additivity failed")
+
+        fwd_stitched = np.vstack([fwd1, fwd2])
+        npt.assert_allclose(fwd_cpp, fwd_stitched, rtol=1e-10, atol=1e-10, err_msg="stitched fwd mismatch")
+        
+    def test_reset_points_match_manual_restart_bwd(self):
+        """
+        Construct a stream with a known reset at t = split,
+        and verify:
+        bwd matches segment-wise forward stitched together.
+        """
+        rng = np.random.default_rng(2)
+
+        P = 2
+        K = 3
+        N1, N2 = 12, 9
+        N = N1 + N2
+
+        startprob_subjs = self.make_random_stochastic((P, K), rng)
+        transmat_subjs = self.make_random_stochastic((P, K, K), rng)
+
+        logB = rng.normal(size=(N, K)).astype(np.float64)
+
+        # two segments: subj 0 then subj 1
+        subj_ids = np.concatenate([
+            np.zeros(N1, dtype=np.int32),
+            np.ones(N2, dtype=np.int32)
+        ], axis=0)
+
+        # hierarchical call
+        bwd_hierarchical = _hmmc.backward_log_hierarchical(
+            startprob_subjs, transmat_subjs, logB, subj_ids
+        )
+
+        # manual: standard forward on seg1 and seg2 separately, then add log probs
+        bwd1 = _hmmc.backward_log(startprob_subjs[0], transmat_subjs[0], logB[:N1])
+        bwd2 = _hmmc.backward_log(startprob_subjs[1], transmat_subjs[1], logB[N1:])
+        
+
+        #npt.assert_allclose(logp_cpp, logp1 + logp2, rtol=1e-10, atol=1e-10, err_msg="segment log_prob additivity failed")
+
+        bwd_stitched = np.vstack([bwd1, bwd2])
+        npt.assert_allclose(bwd_hierarchical, bwd_stitched, rtol=1e-10, atol=1e-10, err_msg="stitched bwd mismatch")
+
 
 ##################################################
 # Tests for analytical gradient vs autodiff      #

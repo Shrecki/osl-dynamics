@@ -1,3 +1,12 @@
+import logging
+import os
+import os.path as op
+import sys
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
+
+
 from osl_dynamics.models.hmm import Config, Model
 from dataclasses import dataclass
 from tensorflow.keras import backend, layers, utils
@@ -9,6 +18,38 @@ from osl_dynamics.inference.layers import (
     StaticLossScalingFactorLayer,
     CholeskyFactorsLayer
 )
+
+import numba
+import numpy as np
+import tensorflow as tf
+import tensorflow_probability as tfp
+from numba.core.errors import NumbaWarning
+from scipy.special import logsumexp, xlogy
+from tqdm.auto import trange
+from pqdm.threads import pqdm
+import logging
+
+
+import osl_dynamics.data.tf as dtf
+from osl_dynamics.inference import initializers, modes
+
+from osl_dynamics.models import obs_mod
+from osl_dynamics.models.mod_base import BaseModelConfig, ModelBase
+from osl_dynamics.simulation import HMM
+from osl_dynamics.utils.misc import set_logging_level
+from osl_dynamics import array_ops
+from osl_dynamics.data import Data
+
+
+from . import _hmmc
+
+_logger = logging.getLogger("osl-dynamics")
+
+warnings.filterwarnings("ignore", category=NumbaWarning)
+logging.getLogger("numba.core.transforms").setLevel(logging.ERROR)
+
+EPS = sys.float_info.epsilon
+
 import tensorflow as tf
 @dataclass
 class HierarchicalConfig(Config):
@@ -744,3 +785,300 @@ class HierarchicalModel(Model):
         
         model = tf.keras.Model(inputs=inputs, outputs=[ll_loss], name="HierarchicalHMM")
         return model
+    
+    
+    def get_posterior(self, x, subj_ids):
+        """Get marginal and joint posterior.
+
+        Parameters
+        ----------
+        x : np.ndarray
+            Observed data. Shape is (batch_size, sequence_length, n_channels).
+        subj_ids: np.ndarray
+            IDs of subjects, indicating which are present for hierarchical modeling. Shape is (batch_size, sequence_length,1).
+
+        Returns
+        -------
+        gamma : np.ndarray
+            Marginal posterior distribution of hidden states given the data,
+            :math:`q(s_t)`. Shape is (batch_size*sequence_length, n_states).
+        xi : np.ndarray
+            Joint posterior distribution of hidden states at two consecutive
+            time points, :math:`q(s_t, s_{t+1})`. Shape is
+            (batch_size*sequence_length-1, n_states*n_states).
+        """
+        P_subjs = self.trans_prob_subj
+        Pi_0_subjs = self.state_probs_t0_subj
+        #import time
+
+        if self.config.implementation == "log":
+            #start_ll = time.time()
+            log_B = self.get_log_likelihood(x, subj_ids)
+            #end_ll = time.time()
+            #start_bw = time.time()
+            batch_size, sequence_length, n_states = log_B.shape
+            log_B = log_B.transpose(2, 0, 1).reshape(n_states, -1).T
+            gamma, xi = self.baum_welch_log_optimized_hierarchical(log_B, Pi_0_subjs, P_subjs, subj_ids)
+            #end_bw = time.time()
+            #print(f"LL compute time: {end_ll - start_ll}")
+            #print(f"BW compute time: {end_bw - start_bw}")
+        else:
+            B = self.get_likelihood(x, subj_ids)            
+            gamma, xi = self.baum_welch_hierarchical(B, Pi_0_subjs, P_subjs,subj_ids)
+        return gamma,xi
+    
+    @numba.jit
+    def baum_welch_log_optimized_hierarchical(self, log_B, Pi_0_subjs, P_subjs, subj_ids):
+        """Optimized version using xi_sum directly."""        
+        log_prob, fwdlattice = _hmmc.forward_log_hierarchical(Pi_0_subjs, P_subjs, log_B,subj_ids)
+        bwdlattice = _hmmc.backward_log_hierarchical(Pi_0_subjs, P_subjs, log_B,subj_ids)
+        
+        log_gamma = fwdlattice + bwdlattice
+        self.log_normalize(log_gamma, axis=1)
+        gamma = np.exp(log_gamma)
+        
+        # Get xi_sum DIRECTLY
+        log_xi_sum = _hmmc.compute_log_xi_sum_hierarchical(fwdlattice, P_subjs, bwdlattice, log_B,subj_ids)
+        xi_sum = np.exp(log_xi_sum)  # Shape: (6, 6)
+        
+        # Reshape to match expected format
+        xi_sum_flat = xi_sum.T.flatten()  # Shape: (36,)
+        
+        return gamma, xi_sum_flat
+    
+    def fit(
+        self,
+        dataset,
+        subject_ids,
+        epochs=None,
+        use_tqdm=False,
+        checkpoint_freq=None,
+        save_filepath=None,
+        dfo_tol=None,
+        verbose=1,
+        **kwargs,
+    ):
+        """Fit model to a dataset.
+
+        Iterates between:
+
+        - Baum-Welch updates of latent variable time courses and transition
+          probability matrix.
+        - TensorFlow updates of observation model parameters.
+
+        Parameters
+        ----------
+        dataset : tf.data.Dataset or osl_dynamics.data.Data
+            Training dataset.
+        subject_ids: np.ndarray
+            Array of subjects (0 to P-1) of shape ntimepoints (one array per subject)
+        epochs : int, optional
+            Number of epochs.
+        use_tqdm : bool, optional
+            Should we use :code:`tqdm` to display a progress bar?
+        checkpoint_freq : int, optional
+            Frequency (in epochs) of saving model checkpoints.
+        save_filepath : str, optional
+            Path to save the model.
+        dfo_tol : float, optional
+            When the maximum fractional occupancy change (from epoch to epoch)
+            is less than this value, we stop the training. If :code:`None`
+            there is no early stopping.
+        verbose : int, optional
+            Verbosity level. :code:`0=silent`.
+        kwargs : keyword arguments, optional
+            Keyword arguments for the TensorFlow observation model training.
+            These keywords arguments will be passed to :code:`self.model.fit()`.
+
+        Returns
+        -------
+        history : dict
+            Dictionary with history of the loss, learning rates (:code:`lr`
+            and :code:`rho`) and fractional occupancies during training.
+        """
+        if epochs is None:
+            epochs = self.config.n_epochs
+
+        if checkpoint_freq is not None:
+            checkpoint = tf.train.Checkpoint(
+                model=self.model, optimizer=self.model.optimizer
+            )
+            if save_filepath is None:
+                save_filepath = "tmp"
+            self.save_config(save_filepath)
+            checkpoint_dir = f"{save_filepath}/checkpoints"
+            checkpoint_prefix = f"{checkpoint_dir}/ckpt"
+
+        if dfo_tol is None:
+            dfo_tol = 0
+
+        # Make a TensorFlow Dataset
+        if isinstance(dataset, Data):
+            sfreq = dataset.sampling_frequency
+        else:
+            sfreq = 1.0
+        import subprocess
+        import psutil
+        import os
+        process = psutil.Process(os.getpid())
+        gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
+        gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
+        _logger.info(f"GPU memory used before make dataset: {gpu_memory_used} MB")
+        
+        mem_usage_mb = process.memory_info().rss / 1024 / 1024
+        _logger.info(f"Memory usage before make dataset: {mem_usage_mb:.2f} MB")
+    
+        # Here fuse the subject IDs with the data such that last channel = subject IDs
+        # This is so that batches will maintain proper ordering between the two arrays seamlessly.
+        assert len(dataset.arrays) == len(subject_ids), "Dataset and subject IDs should contain the same number of arrays"
+        dataset.arrays = [np.concatenate((dataset.arrays[i],subject_ids[i][:,None]),axis=1) for i in range(len(dataset.arrays))]
+    
+        dataset = self.make_dataset(dataset, shuffle=False, concatenate=True)
+        gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
+        gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
+        _logger.info(f"GPU memory used after make dataset: {gpu_memory_used} MB")
+        
+        mem_usage_mb = process.memory_info().rss / 1024 / 1024
+        _logger.info(f"Memory usage after make dataset: {mem_usage_mb:.2f} MB")
+        # Set static loss scaling factor (Sets bash size in model)
+        self.set_static_loss_scaling_factor(dataset)
+        
+        
+        # Training curves
+        history = {"loss": [], "rho": [], "lr": [], "fo": [], "max_dfo": []}
+
+        from keras.callbacks import EarlyStopping
+
+        # create this once, before the loop
+        stopper = EarlyStopping(monitor='loss', min_delta=1e-4, patience=20, verbose=1)
+        stopper.set_model(self.model)
+        stopper.on_train_begin()
+        
+        #import time
+
+        # Loop through epochs
+        if use_tqdm:
+            _range = trange(epochs)
+        else:
+            _range = range(epochs)
+        for n in _range:
+            # Setup a progress bar for this epoch
+            if verbose > 0 and not use_tqdm:
+                print("Epoch {}/{}".format(n + 1, epochs))
+                pb_i = utils.Progbar(dtf.get_n_batches(dataset))
+
+            # Update rho
+            self._update_rho(n)
+
+            # Set learning rate for the observation model
+            lr = self.config.learning_rate * np.exp(
+                -self.config.observation_update_decay * n
+            )
+            backend.set_value(self.model.optimizer.lr, lr)
+
+            # Loop over batches
+            loss = []
+            occupancies = []
+            for element in dataset:
+                x = self._unpack_inputs(element)
+                subj_ids = x[:,-1]
+                x = x[:,:-1]
+                
+                # Get the gamma tcs, which must account for subject IDs
+                gamma, xi_sum = self.get_posterior(x,subj_ids)
+
+                # Update transition probability matrix
+                if self.config.learn_trans_prob:
+                    self.update_trans_prob_optimized(gamma, xi_sum)
+
+                # Calculate fractional occupancy
+                stc = modes.argmax_time_courses(gamma)
+                occupancies.append(np.sum(stc, axis=0))
+
+                # Reshape gamma: (batch_size*sequence_length, n_states)
+                # -> (batch_size, sequence_length, n_states)
+                gamma = gamma.reshape(x.shape[0], x.shape[1], -1)
+
+                # Convert to tensor: avoids reconverting x over and over!
+                gamma = tf.convert_to_tensor(gamma, dtype=tf.float32)
+                # Update observation model
+                
+                # TODO: figure out how to pass here the subj_ids as well !
+                x_and_gamma = tf.concat([x, gamma], axis=2)
+                h = None
+                #end_other = time.time()
+                #start_fit_params = time.time()
+                h = self.model.train_on_batch(x_and_gamma, return_dict=True, **kwargs)
+                #end_fit_params = time.time()
+                
+                #print(f"Posterior compute time: {end_post - start_post}")
+                #print(f"Intermediate updates and conversions compute time: {end_other - start_other}")
+                #print(f"Fit params compute time: {end_fit_params - start_fit_params}")
+
+                # Get new loss
+                l = float(h["loss"])
+                #l = h.history["loss"][0]
+                if np.isnan(l):
+                    _logger.error("Training failed!")
+                    return
+                loss.append(l)
+
+                if verbose > 0:
+                    # Update progress bar
+                    if use_tqdm:
+                        _range.set_postfix(rho=self.rho, lr=lr, loss=l)
+                    else:
+                        pb_i.add(
+                            1,
+                            values=[("rho", self.rho), ("lr", lr), ("loss", l)],
+                        )
+            gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
+            gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
+            _logger.info(f"GPU memory used after single iter: {gpu_memory_used} MB")
+            
+            mem_usage_mb = process.memory_info().rss / 1024 / 1024
+            _logger.info(f"Memory usage after single iter: {mem_usage_mb:.2f} MB")
+
+            history["loss"].append(np.mean(loss))
+            history["rho"].append(self.rho)
+            history["lr"].append(lr)
+
+            occupancy = np.sum(occupancies, axis=0)
+            fo = occupancy / np.sum(occupancy)
+            history["fo"].append(fo)
+
+            # Save model checkpoint
+            if checkpoint_freq is not None and (n + 1) % checkpoint_freq == 0:
+                checkpoint.save(file_prefix=checkpoint_prefix)
+
+            # How much has the fractional occupancy changed?
+            if len(history["fo"]) == 1:
+                max_dfo = np.max(
+                    np.abs(history["fo"][-1] - np.zeros_like(history["fo"][-1]))
+                )
+            else:
+                max_dfo = np.max(np.abs(history["fo"][-1] - history["fo"][-2]))
+            history["max_dfo"].append(max_dfo)
+            if dfo_tol > 0:
+                print(f"Max change in FO: {max_dfo}")
+            if max_dfo < dfo_tol:
+                break
+            
+            logs = {'loss': history['loss'][-1]}
+            stopper.on_epoch_end(n,logs)
+            if stopper.stopped_epoch > 0:
+                print(f"Stopping at epoch {n}")
+                break
+            gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
+            gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
+            _logger.info(f"GPU memory used after end of iter: {gpu_memory_used} MB")
+            
+            mem_usage_mb = process.memory_info().rss / 1024 / 1024
+            _logger.info(f"Memory usage after end of iter: {mem_usage_mb:.2f} MB")
+        if checkpoint_freq is not None:
+            np.save(f"{save_filepath}/trans_prob.npy", self.trans_prob)
+
+        if use_tqdm:
+            _range.close()
+
+        return history

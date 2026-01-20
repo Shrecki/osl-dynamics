@@ -152,6 +152,93 @@ std::tuple<double, py::array_t<double>> forward_log(
     return {log_prob, fwdlattice_};
 }
 
+std::tuple<double, py::array_t<double>> forward_log_hierarchical(
+    py::array_t<double> startprob_subjs_,
+    py::array_t<double> transmat_subjs_,
+    py::array_t<double> log_frameprob_,
+    py::array_t<unsigned int> subject_ids)
+{
+    auto log_startprob_subjs_ = log(startprob_subjs_); // (P,K)
+    auto log_startprob_subjs = log_startprob_subjs_.unchecked<2>();
+
+    auto log_transmat_subjs_ = log(transmat_subjs_); // (P,K,K)
+    auto log_transmat_subjs = log_transmat_subjs_.unchecked<3>();
+
+    auto log_frameprob = log_frameprob_.unchecked<2>();
+    auto subj_ids = subject_ids.unchecked<1>();
+    // auto seq_start = seq_start_.unchecked<1>();
+
+    auto ns = log_frameprob.shape(0); // N
+    auto nc = log_frameprob.shape(1); // K
+    auto P = log_startprob_subjs.shape(0);
+
+    if (log_startprob_subjs.shape(1) != nc || log_transmat_subjs.shape(0) != P ||
+        log_transmat_subjs.shape(1) != nc ||
+        log_transmat_subjs.shape(2) != nc ||
+        subj_ids.shape(0) != ns)
+    {
+        throw std::invalid_argument{"shape mismatch"};
+    }
+    auto buf = std::vector<double>(nc);
+    auto fwdlattice_ = py::array_t<double>{{ns, nc}};
+    auto fwd = fwdlattice_.mutable_unchecked<2>();
+    double total_log_prob = 0.0;
+    {
+        py::gil_scoped_release nogil;
+
+        auto is_reset = [&](ssize_t t) -> bool
+        {
+            if (t == 0)
+                return true;
+            return subj_ids(t) != subj_ids(t - 1);
+        };
+
+        auto is_segment_end = [&](ssize_t t) -> bool
+        {
+            if (t == ns - 1)
+                return true;
+            return subj_ids(t + 1) != subj_ids(t);
+        };
+
+        for (auto t = 0; t < ns; ++t)
+        {
+            int32_t p = subj_ids(t);
+            if (p < 0 || p >= P)
+            {
+                // can't throw with nogil cleanly; you can precheck with GIL,
+                // or set a flag. Keeping it simple here: assume valid ids.
+            }
+            if (is_reset(t))
+            {
+                for (ssize_t j = 0; j < nc; ++j)
+                {
+                    fwd(t, j) = log_startprob_subjs(p, j) + log_frameprob(t, j);
+                }
+            }
+            else
+            {
+                for (ssize_t j = 0; j < nc; ++j)
+                {
+                    for (ssize_t i = 0; i < nc; ++i)
+                    {
+                        buf[i] = fwd(t - 1, i) + log_transmat_subjs(p, i, j);
+                    }
+                    fwd(t, j) = logsumexp(buf.data(), nc) + log_frameprob(t, j);
+                }
+            }
+
+            // Because resets split the chain into independent segments,
+            // the total log-prob is the sum of segment log-probs.
+            if (is_segment_end(t))
+            {
+                total_log_prob += logsumexp(&fwd(t, 0), nc);
+            }
+        }
+    }
+    // auto log_prob = logsumexp(&fwd(ns - 1, 0), nc);
+    return {total_log_prob, fwdlattice_};
+}
+
 py::array_t<double> backward_scaling(
     py::array_t<double> startprob_,
     py::array_t<double> transmat_,
@@ -163,6 +250,7 @@ py::array_t<double> backward_scaling(
     auto frameprob = frameprob_.unchecked<2>();
     auto scaling = scaling_.unchecked<1>();
     auto ns = frameprob.shape(0), nc = frameprob.shape(1);
+
     if (startprob.shape(0) != nc || transmat.shape(0) != nc || transmat.shape(1) != nc || scaling.shape(0) != ns)
     {
         throw std::invalid_argument{"shape mismatch"};
@@ -226,6 +314,73 @@ py::array_t<double> backward_log(
     return bwdlattice_;
 }
 
+py::array_t<double> backward_log_hierarchical(
+    py::array_t<double> startprob_,
+    py::array_t<double> transmat_,
+    py::array_t<double> log_frameprob_,
+    py::array_t<unsigned int> subject_ids)
+{
+    // auto log_startprob_ = log(startprob_);
+    // auto log_startprob = log_startprob_.unchecked<2>();
+    auto log_transmat_ = log(transmat_);
+    auto log_transmat = log_transmat_.unchecked<3>();
+    auto log_frameprob = log_frameprob_.unchecked<2>();
+    auto ns = log_frameprob.shape(0), nc = log_frameprob.shape(1);
+    ssize_t P = log_transmat.shape(0);
+
+    auto subj_ids = subject_ids.unchecked<1>();
+
+    if (log_transmat.shape(1) != nc || log_transmat.shape(2) != nc || subj_ids.shape(0) != ns)
+    {
+        throw std::invalid_argument{"shape mismatch"};
+    }
+    auto buf = std::vector<double>(nc);
+    auto bwdlattice_ = py::array_t<double>{{ns, nc}};
+    auto bwd = bwdlattice_.mutable_unchecked<2>();
+
+    for (ssize_t t = 0; t < ns; ++t)
+        if (static_cast<ssize_t>(subj_ids(t)) >= P)
+            throw std::invalid_argument{"subject_id out of range"};
+    py::gil_scoped_release nogil;
+    {
+
+        auto is_segment_end = [&](ssize_t t) -> bool
+        {
+            if (t == ns - 1)
+                return true;
+            return subj_ids(t + 1) != subj_ids(t);
+        };
+
+        if (ns == 0)
+            return bwdlattice_;
+
+        for (ssize_t t = ns; t-- > 0;)
+        {
+            ssize_t p = static_cast<ssize_t>(subj_ids(t));
+
+            if (is_segment_end(t))
+            {
+                for (auto i = 0; i < nc; ++i)
+                {
+                    bwd(t, i) = 0;
+                }
+            }
+            else
+            {
+                for (auto i = 0; i < nc; ++i)
+                {
+                    for (auto j = 0; j < nc; ++j)
+                    {
+                        buf[j] = log_transmat(p, i, j) + log_frameprob(t + 1, j) + bwd(t + 1, j);
+                    }
+                    bwd(t, i) = logsumexp(buf.data(), nc);
+                }
+            }
+        }
+    }
+    return bwdlattice_;
+}
+
 py::array_t<double> compute_scaling_xi_sum(
     py::array_t<double> fwdlattice_,
     py::array_t<double> transmat_,
@@ -263,6 +418,43 @@ py::array_t<double> compute_log_xi_sum(
     py::array_t<double> transmat_,
     py::array_t<double> bwdlattice_,
     py::array_t<double> log_frameprob_)
+{
+    auto fwd = fwdlattice_.unchecked<2>();
+    auto log_transmat_ = log(transmat_);
+    auto log_transmat = log_transmat_.unchecked<2>();
+    auto bwd = bwdlattice_.unchecked<2>();
+    auto log_frameprob = log_frameprob_.unchecked<2>();
+    auto ns = log_frameprob.shape(0), nc = log_frameprob.shape(1);
+    if (fwd.shape(0) != ns || fwd.shape(1) != nc || log_transmat.shape(0) != nc || log_transmat.shape(1) != nc || bwd.shape(0) != ns || bwd.shape(1) != nc)
+    {
+        throw std::invalid_argument{"shape mismatch"};
+    }
+    auto log_prob = logsumexp(&fwd(ns - 1, 0), nc);
+    auto log_xi_sum_ = py::array_t<double>{{nc, nc}};
+    auto log_xi_sum = log_xi_sum_.mutable_unchecked<2>();
+    std::fill_n(log_xi_sum.mutable_data(0, 0), log_xi_sum.size(),
+                -std::numeric_limits<double>::infinity());
+    py::gil_scoped_release nogil;
+    for (auto t = 0; t < ns - 1; ++t)
+    {
+        for (auto i = 0; i < nc; ++i)
+        {
+            for (auto j = 0; j < nc; ++j)
+            {
+                auto log_xi = fwd(t, i) + log_transmat(i, j) + log_frameprob(t + 1, j) + bwd(t + 1, j) - log_prob;
+                log_xi_sum(i, j) = logaddexp(log_xi_sum(i, j), log_xi);
+            }
+        }
+    }
+    return log_xi_sum_;
+}
+
+py::array_t<double> compute_log_xi_sum_hierarchical(
+    py::array_t<double> fwdlattice_,
+    py::array_t<double> transmat_,
+    py::array_t<double> bwdlattice_,
+    py::array_t<double> log_frameprob_,
+    py::array_t<unsigned int> subject_ids)
 {
     auto fwd = fwdlattice_.unchecked<2>();
     auto log_transmat_ = log(transmat_);
@@ -387,10 +579,14 @@ PYBIND11_MODULE(_hmmc, m)
     m
         .def("forward_scaling", forward_scaling)
         .def("forward_log", forward_log)
+        .def("forward_log_hierarchical", forward_log_hierarchical)
         .def("backward_scaling", backward_scaling)
         .def("backward_log", backward_log)
+        .def("backward_log_hierarchical", backward_log_hierarchical)
         .def("compute_scaling_xi_sum", compute_scaling_xi_sum)
         .def("compute_log_xi_sum", compute_log_xi_sum)
+        .def("compute_log_xi_sum_hierarchical", compute_log_xi_sum_hierarchical)
+
         .def("compute_log_xi", compute_log_xi)
         .def("viterbi", viterbi);
 }
