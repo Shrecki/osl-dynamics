@@ -13,13 +13,16 @@ import tensorflow_probability as tfp
 import numpy.testing as npt
 
 from osl_dynamics.models import _hmmc
+from osl_dynamics.data import Data
 
 
 from osl_dynamics.models.hmm_hierarchical import (
     hierarchical_categorical_nll_mean_custom_grad,
     hierarchical_categorical_nll_sum_custom_grad,
     HierarchicalCategoricalLogLikelihoodLossLayer,
-    sort_and_rowsplit_by_subject
+    sort_and_rowsplit_by_subject,
+    HierarchicalConfig,
+    HierarchicalModel
 )
 
 def convert_to_dense(grad):
@@ -515,13 +518,8 @@ class TestCppBW:
         # manual: standard forward on seg1 and seg2 separately, then add log probs
         logp1, fwd1 = _hmmc.forward_log(startprob_subjs[0], transmat_subjs[0], logB[:N1])
         logp2, fwd2 = _hmmc.forward_log(startprob_subjs[1], transmat_subjs[1], logB[N1:])
-        
-        print(fwd_cpp)
-        
-        print(fwd1)
-        print(fwd2)
 
-        #npt.assert_allclose(logp_cpp, logp1 + logp2, rtol=1e-10, atol=1e-10, err_msg="segment log_prob additivity failed")
+        npt.assert_allclose(logp_cpp, logp1 + logp2, rtol=1e-10, atol=1e-10, err_msg="segment log_prob additivity failed")
 
         fwd_stitched = np.vstack([fwd1, fwd2])
         npt.assert_allclose(fwd_cpp, fwd_stitched, rtol=1e-10, atol=1e-10, err_msg="stitched fwd mismatch")
@@ -559,11 +557,130 @@ class TestCppBW:
         bwd1 = _hmmc.backward_log(startprob_subjs[0], transmat_subjs[0], logB[:N1])
         bwd2 = _hmmc.backward_log(startprob_subjs[1], transmat_subjs[1], logB[N1:])
         
-
-        #npt.assert_allclose(logp_cpp, logp1 + logp2, rtol=1e-10, atol=1e-10, err_msg="segment log_prob additivity failed")
-
         bwd_stitched = np.vstack([bwd1, bwd2])
         npt.assert_allclose(bwd_hierarchical, bwd_stitched, rtol=1e-10, atol=1e-10, err_msg="stitched bwd mismatch")
+        
+    def row_normalize(self, mat):
+        mat = np.asarray(mat)
+        s = mat.sum(axis=-1, keepdims=True)
+        return mat / s
+    
+    def test_no_subject_changes_reduces_to_standard_xi_sum(self):
+        rng = np.random.default_rng(1)
+
+        P = 3
+        K = 4
+        N = 30
+
+        startprob_subjs = self.make_random_stochastic((P, K), rng)
+        transmat_subjs = self.make_random_stochastic((P, K, K), rng)
+        logB = rng.normal(size=(N, K)).astype(np.float64)
+
+        # constant subject id => should match a standard forward on that subject
+        p = 2
+        subj_ids = np.full((N,), p, dtype=np.int32)
+
+        # compare against your existing standard forward_log for that subject, if available:
+        # forward_log(startprob, transmat, log_frameprob)
+        # If your module exposes forward_log, this is a great regression check.
+        log_probs_hierarch, fwd_hierarch = _hmmc.forward_log_hierarchical(startprob_subjs, transmat_subjs, logB, subj_ids)
+        bwd_hierarc = _hmmc.backward_log_hierarchical(
+            startprob_subjs, transmat_subjs, logB,subj_ids
+        )
+        xi_sum_hierarch = _hmmc.compute_log_xi_sum_hierarchical(fwd_hierarch, transmat_subjs, bwd_hierarc, logB, subj_ids)
+        xi_sum_std = _hmmc.compute_log_xi_sum(fwd_hierarch, transmat_subjs[p], bwd_hierarc, logB)
+        
+        npt.assert_allclose(self.row_normalize(np.exp(xi_sum_hierarch[p])), self.row_normalize(np.exp(xi_sum_std)), rtol=1e-10, atol=1e-10, err_msg="log_xi_sum mismatch vs standard")
+        npt.assert_allclose(xi_sum_hierarch[0], np.ones((K,K))*(-np.inf), rtol=1e-10, atol=1e-10, err_msg="log_xi_sum mismatch vs standard")
+        npt.assert_allclose(xi_sum_hierarch[1], np.ones((K,K))*(-np.inf), rtol=1e-10, atol=1e-10, err_msg="log_xi_sum mismatch vs standard")
+        
+    def test_reset_points_match_manual_restart_xi_sum_one_empty_subj(self):
+        """
+        Construct a stream with a known reset at t = split,
+        and verify:
+        xi_sum matches segment-wise xi_sum stitched together.
+        """
+        rng = np.random.default_rng(2)
+
+        P = 3
+        K = 4
+        N1, N2 = 12, 9
+        N = N1 + N2
+
+        startprob_subjs = self.make_random_stochastic((P, K), rng)
+        transmat_subjs = self.make_random_stochastic((P, K, K), rng)
+
+        logB = rng.normal(size=(N, K)).astype(np.float64)
+
+        # two segments: subj 0 then subj 1
+        subj_ids = np.concatenate([
+            np.zeros(N1, dtype=np.int32),
+            np.ones(N2, dtype=np.int32)
+        ], axis=0)
+        
+        # Here is the xi_sum_hierarchical
+        log_probs_hierarch, fwd_hierarch = _hmmc.forward_log_hierarchical(startprob_subjs, transmat_subjs, logB, subj_ids)
+        bwd_hierarc = _hmmc.backward_log_hierarchical(
+            startprob_subjs, transmat_subjs, logB,subj_ids
+        )
+        xi_sum_hierarch = _hmmc.compute_log_xi_sum_hierarchical(fwd_hierarch, transmat_subjs, bwd_hierarc, logB, subj_ids)
+        
+        # Here is two segments on which forward/backward and xi_sum are computed
+        _,fwd1 = _hmmc.forward_log(startprob_subjs[0], transmat_subjs[0], logB[:N1])
+        _,fwd2 = _hmmc.forward_log(startprob_subjs[1], transmat_subjs[1], logB[N1:])
+        bwd1 = _hmmc.backward_log(startprob_subjs[0], transmat_subjs[0], logB[:N1])
+        bwd2 = _hmmc.backward_log(startprob_subjs[1], transmat_subjs[1], logB[N1:])
+
+        xi_sum1 = _hmmc.compute_log_xi_sum(fwd1, transmat_subjs[0], bwd1, logB[:N1])
+        xi_sum2 = _hmmc.compute_log_xi_sum(fwd2, transmat_subjs[1], bwd2, logB[N1:])
+        
+        npt.assert_allclose(self.row_normalize(np.exp(xi_sum_hierarch[0])), self.row_normalize(np.exp(xi_sum1)), rtol=1e-10, atol=1e-10, err_msg="log_xi_sum mismatch vs standard")
+        npt.assert_allclose(self.row_normalize(np.exp(xi_sum_hierarch[1])), self.row_normalize(np.exp(xi_sum2)), rtol=1e-10, atol=1e-10, err_msg="log_xi_sum mismatch vs standard")
+        npt.assert_allclose(xi_sum_hierarch[2], np.ones((K,K))*(-np.inf), rtol=1e-10, atol=1e-10, err_msg="log_xi_sum mismatch vs standard")
+
+    
+    def test_reset_points_match_manual_restart_xi_sum(self):
+        """
+        Construct a stream with a known reset at t = split,
+        and verify:
+        xi_sum matches segment-wise xi_sum stitched together.
+        """
+        rng = np.random.default_rng(2)
+
+        P = 3
+        K = 5
+        N1, N2 = 12, 9
+        N = N1 + N2
+
+        startprob_subjs = self.make_random_stochastic((P, K), rng)
+        transmat_subjs = self.make_random_stochastic((P, K, K), rng)
+
+        logB = rng.normal(size=(N, K)).astype(np.float64)
+
+        # two segments: subj 0 then subj 1
+        subj_ids = np.concatenate([
+            np.zeros(N1, dtype=np.int32),
+            np.ones(N2, dtype=np.int32)
+        ], axis=0)
+        
+        # Here is the xi_sum_hierarchical
+        log_probs_hierarch, fwd_hierarch = _hmmc.forward_log_hierarchical(startprob_subjs, transmat_subjs, logB, subj_ids)
+        bwd_hierarc = _hmmc.backward_log_hierarchical(
+            startprob_subjs, transmat_subjs, logB,subj_ids
+        )
+        xi_sum_hierarch = _hmmc.compute_log_xi_sum_hierarchical(fwd_hierarch, transmat_subjs, bwd_hierarc, logB, subj_ids)
+        
+        # Here is two segments on which forward/backward and xi_sum are computed
+        _,fwd1 = _hmmc.forward_log(startprob_subjs[0], transmat_subjs[0], logB[:N1])
+        _,fwd2 = _hmmc.forward_log(startprob_subjs[1], transmat_subjs[1], logB[N1:])
+        bwd1 = _hmmc.backward_log(startprob_subjs[0], transmat_subjs[0], logB[:N1])
+        bwd2 = _hmmc.backward_log(startprob_subjs[1], transmat_subjs[1], logB[N1:])
+
+        xi_sum1 = _hmmc.compute_log_xi_sum(fwd1, transmat_subjs[0], bwd1, logB[:N1])
+        xi_sum2 = _hmmc.compute_log_xi_sum(fwd2, transmat_subjs[1], bwd2, logB[N1:])
+        
+        npt.assert_allclose(self.row_normalize(np.exp(xi_sum_hierarch[0])), self.row_normalize(np.exp(xi_sum1)), rtol=1e-10, atol=1e-10, err_msg="log_xi_sum mismatch vs standard")
+        npt.assert_allclose(self.row_normalize(np.exp(xi_sum_hierarch[1])), self.row_normalize(np.exp(xi_sum2)), rtol=1e-10, atol=1e-10, err_msg="log_xi_sum mismatch vs standard")
 
 
 ##################################################
@@ -1069,7 +1186,6 @@ class TestAnalyticalVsAutodiff:
             )
 
 
-
 # =============================================================================
 # Tests for gradient correctness
 # =============================================================================
@@ -1186,6 +1302,45 @@ class TestGradientCorrectness:
             err_msg=f"L_subj gradient mismatch for calculation={calculation}"
         )
 
+
+###############################################################################
+# Tests for HMM fit interface
+###############################################################################
+class TestHMMModel:
+    def test_hmm_fit(self):
+        # Minimal config
+        config = HierarchicalConfig(
+            n_states=3,
+            n_channels=10,
+            n_subjects=4,
+            sequence_length=100,
+            batch_size=8,
+            learning_rate=0.01,
+            learn_means=True,
+            learn_covariances=True,
+            n_epochs=1,
+            initial_covariances_pop=None
+        )
+        
+        # Create model
+        model = HierarchicalModel(config)
+        
+        # Generate synthetic data
+        np.random.seed(42)
+        data = Data([np.random.randn(500, config.n_channels).astype(np.float32) 
+                for _ in range(config.n_subjects)], time_axis_first=True, sampling_frequency=250)
+        subject_ids = [np.array([i]*500)for i in range(config.n_subjects)]
+        
+        # Fit - should not raise
+        history = model.fit(
+            data,
+            subject_ids=subject_ids,
+            epochs=2,
+            verbose=1,
+        )
+        
+        assert history is not None
+        print("✓ Fit completed successfully")
 
 # =============================================================================
 # Tests for absent subject behavior

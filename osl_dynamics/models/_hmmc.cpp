@@ -458,28 +458,42 @@ py::array_t<double> compute_log_xi_sum_hierarchical(
 {
     auto fwd = fwdlattice_.unchecked<2>();
     auto log_transmat_ = log(transmat_);
-    auto log_transmat = log_transmat_.unchecked<2>();
+    auto log_transmat = log_transmat_.unchecked<3>();
     auto bwd = bwdlattice_.unchecked<2>();
     auto log_frameprob = log_frameprob_.unchecked<2>();
     auto ns = log_frameprob.shape(0), nc = log_frameprob.shape(1);
-    if (fwd.shape(0) != ns || fwd.shape(1) != nc || log_transmat.shape(0) != nc || log_transmat.shape(1) != nc || bwd.shape(0) != ns || bwd.shape(1) != nc)
+    ssize_t P = log_transmat.shape(0);
+
+    auto subj_ids = subject_ids.unchecked<1>();
+    if (fwd.shape(0) != ns || fwd.shape(1) != nc || log_transmat.shape(1) != nc || log_transmat.shape(2) != nc || bwd.shape(0) != ns || bwd.shape(1) != nc || subj_ids.shape(0) != ns)
     {
         throw std::invalid_argument{"shape mismatch"};
     }
-    auto log_prob = logsumexp(&fwd(ns - 1, 0), nc);
-    auto log_xi_sum_ = py::array_t<double>{{nc, nc}};
-    auto log_xi_sum = log_xi_sum_.mutable_unchecked<2>();
-    std::fill_n(log_xi_sum.mutable_data(0, 0), log_xi_sum.size(),
+
+    for (ssize_t t = 0; t < ns; ++t)
+        if (static_cast<ssize_t>(subj_ids(t)) >= P)
+            throw std::invalid_argument{"subject_id out of range"};
+
+    // auto log_prob = logsumexp(&fwd(ns - 1, 0), nc);
+    auto log_xi_sum_ = py::array_t<double>{{P, nc, nc}};
+    auto log_xi_sum = log_xi_sum_.mutable_unchecked<3>();
+    std::fill_n(log_xi_sum.mutable_data(0, 0, 0), log_xi_sum.size(),
                 -std::numeric_limits<double>::infinity());
     py::gil_scoped_release nogil;
-    for (auto t = 0; t < ns - 1; ++t)
     {
-        for (auto i = 0; i < nc; ++i)
+        for (ssize_t t = 0; t < ns - 1; ++t)
         {
-            for (auto j = 0; j < nc; ++j)
+            ssize_t p = static_cast<ssize_t>(subj_ids(t));
+            if (subj_ids(t + 1) != subj_ids(t))
+                continue; // Don't count transitions between different subjects
+
+            for (auto i = 0; i < nc; ++i)
             {
-                auto log_xi = fwd(t, i) + log_transmat(i, j) + log_frameprob(t + 1, j) + bwd(t + 1, j) - log_prob;
-                log_xi_sum(i, j) = logaddexp(log_xi_sum(i, j), log_xi);
+                for (auto j = 0; j < nc; ++j)
+                {
+                    auto log_xi = fwd(t, i) + log_transmat(p, i, j) + log_frameprob(t + 1, j) + bwd(t + 1, j); // - log_prob;
+                    log_xi_sum(p, i, j) = logaddexp(log_xi_sum(p, i, j), log_xi);
+                }
             }
         }
     }
