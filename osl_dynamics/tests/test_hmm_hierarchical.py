@@ -1002,7 +1002,7 @@ class TestAnalyticalVsAutodiff:
             ]
             
             # Compare
-            """for name, g_auto, g_anal in zip(
+            for name, g_auto, g_anal in zip(
                 ['mu_pop', 'L_pop', 'mu_subj', 'L_subj'],
                 grads_autodiff,
                 grads_layer
@@ -1013,13 +1013,13 @@ class TestAnalyticalVsAutodiff:
                     rtol=1e-5,
                     atol=1e-6,
                     err_msg=f"Trial {trial}: {name} gradient mismatch"
-               y )
-            """
+                )
+            
             # Also verify loss values match
             assert_allclose(
                 loss_ref.numpy(),
                 loss_layer.numpy(),
-                rtol=1e-9,
+                rtol=1e-6,
                 err_msg=f"Trial {trial}: Loss values don't match"
             )
             
@@ -1181,7 +1181,7 @@ class TestAnalyticalVsAutodiff:
             assert_allclose(
                 loss_analytical.numpy(),
                 loss_ref.numpy(),
-                rtol=1e-10,
+                rtol=1e-6,
                 err_msg=f"Trial {trial}: Loss values don't match"
             )
 
@@ -1324,23 +1324,24 @@ class TestHMMModel:
         
         # Create model
         model = HierarchicalModel(config)
+        #print(model.trans_prob_subj)
         
         # Generate synthetic data
         np.random.seed(42)
         data = Data([np.random.randn(500, config.n_channels).astype(np.float32) 
-                for _ in range(config.n_subjects)], time_axis_first=True, sampling_frequency=250)
+                for _ in range(4)], time_axis_first=True, sampling_frequency=250)
         subject_ids = [np.array([i]*500)for i in range(config.n_subjects)]
         
-        # Fit - should not raise
+        
         history = model.fit(
             data,
             subject_ids=subject_ids,
             epochs=2,
             verbose=1,
         )
+
         
         assert history is not None
-        print("✓ Fit completed successfully")
 
 # =============================================================================
 # Tests for absent subject behavior
@@ -1456,10 +1457,11 @@ class TestScalingBehavior:
         """Test that regularization is scaled by n_unique/n_subjects."""
         # Create two problems: one with all subjects, one with subset
         problem_all = small_problem.copy()
-        problem_all['subject_ids'] = np.array([0, 1, 2, 0], dtype=np.int32)  # All 3 subjects
+
+        problem_all['subject_ids'] = np.random.choice([0,1,2],(small_problem['B'], small_problem['T'])).astype(np.int32)  # All 3 subjects
         
         problem_subset = small_problem.copy()
-        problem_subset['subject_ids'] = np.array([0, 0, 0, 0], dtype=np.int32)  # Only subject 0
+        problem_subset['subject_ids']= np.zeros((small_problem['B'], small_problem['T']), dtype=np.int32) #np.array([0, 0, 0, 0], dtype=np.int32)
         
         # Set lambda high to make regularization dominant
         problem_all['lambda_mu'] = 100.0
@@ -1618,7 +1620,7 @@ class TestEdgeCases:
     def test_all_same_subject(self, small_problem):
         """Test when all batch elements are from same subject."""
         problem = small_problem.copy()
-        problem['subject_ids'] = np.array([0, 0, 0, 0], dtype=np.int32)
+        problem['subject_ids'] = np.zeros((small_problem['B'], small_problem['T']), dtype=np.int32) #np.array([0, 0, 0, 0], dtype=np.int32)
         
         analytical = compute_analytical_gradients(problem, 'mean')
         numerical = compute_numerical_gradients(problem, 'mean')

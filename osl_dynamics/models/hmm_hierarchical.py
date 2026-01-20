@@ -257,10 +257,8 @@ def hierarchical_categorical_nll_mean_custom_grad(
     dtype = mu_pop.dtype
     x = tf.cast(x, dtype)
     gamma = tf.cast(gamma, dtype)
-    subject_ids = tf.cast(tf.reshape(subject_ids, [-1]), tf.int32)
     lambda_mu = tf.cast(lambda_mu, dtype)
     lambda_L = tf.cast(lambda_L, dtype)
-
     n_subjects = tf.cast(n_subjects, dtype)
     
     B = tf.shape(x)[0]
@@ -268,11 +266,8 @@ def hierarchical_categorical_nll_mean_custom_grad(
     D = tf.shape(x)[2]
     K = tf.shape(mu_pop)[0]
     P = tf.shape(mu_subj)[0]
-    
-    
-    # =====================
-    # Sort subjects by their IDs to break into consecutive segments the data (for emission forward, no need to have consecutive samples)
-    # =====================
+    subject_ids = tf.cast(tf.reshape(subject_ids, [-1]), tf.int32)
+
     unique_subjects, row_splits, x_sorted, gamma_sorted, _ = sort_and_rowsplit_by_subject(
         x, gamma, subject_ids
     )
@@ -281,11 +276,10 @@ def hierarchical_categorical_nll_mean_custom_grad(
     S = tf.shape(unique_subjects)[0]
     
     # =====================
-    # Forward pass: compute NLL
+    # Forward pass: compute NLL and cache intermediates for backward
     # =====================
-    nll_sum = tf.zeros([], dtype=dtype)  # accumulate total negative log-likelihood numerator
     
-    def per_subject_ll(i):
+    def per_subject_forward(i):
         start = row_splits[i]
         stop  = row_splits[i + 1]
         sid   = unique_subjects[i]
@@ -296,45 +290,74 @@ def hierarchical_categorical_nll_mean_custom_grad(
         mu_i = tf.gather(mu_subj, sid, axis=0) # (K, D)
         L_i  = tf.gather(L_subj,  sid, axis=0) # (K, D, D)
 
-        mvn = tfp.distributions.MultivariateNormalTriL(
-            loc=mu_i,
-            scale_tril=L_i,
-            allow_nan_stats=False
+        # Residuals: (N_i, K, D)
+        r = x_block[:, None, :] - mu_i[None, :, :]
+        
+        # y = L^{-1} r: (N_i, K, D)
+        y = tf.linalg.triangular_solve(L_i[None, ...], r[..., None], lower=True)
+        y = tf.squeeze(y, axis=-1)
+        
+        # Mahalanobis squared: (N_i, K)
+        mahal_sq = tf.reduce_sum(tf.square(y), axis=-1)
+        
+        # Log det: (K,)
+        log_det = 2.0 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(L_i)), axis=-1)
+        
+        # Log prob: (N_i, K)
+        log_2pi = tf.cast(tf.math.log(2.0 * np.pi), dtype)
+        D_float = tf.cast(D, dtype)
+        logp = -0.5 * (D_float * log_2pi + log_det[None, :] + mahal_sq)
+        
+        # NLL contribution (scalar)
+        nll_contrib = -tf.reduce_sum(g_block * logp)
+        
+        # Cache for backward: weighted sums we'll need
+        w = g_block / N  # (N_i, K)
+        
+        # For mu gradient: need sum of w * u where u = L^{-T} y
+        u = tf.linalg.triangular_solve(
+            tf.linalg.matrix_transpose(L_i)[None, ...],
+            y[..., None],
+            lower=False
         )
-        logp = mvn.log_prob(x_block[:, None, :])          # (N_i, K)
+        u = tf.squeeze(u, axis=-1)  # (N_i, K, D)
+        sum_wu = tf.einsum("nk,nkd->kd", w, u)  # (K, D)
+        
+        # For L gradient: need sum of w * r * r^T -> (K, D, D)
+        S_k = tf.einsum("nk,nkd,nkf->kdf", w, r, r)
+        
+        # N_k = sum of weights per state: (K,)
+        N_k = tf.reduce_sum(w, axis=0)
+        
+        return nll_contrib, sid, sum_wu, S_k, N_k
 
-        # return NEGATIVE contribution (so we can sum directly)
-        return -tf.reduce_sum(g_block * logp)             # scalar
-
-    nll_sum = tf.reduce_sum(
-        tf.map_fn(per_subject_ll, tf.range(S), fn_output_signature=dtype)
-    )
-    
-    nll = nll_sum/ N
-    # =====================
-    # Regularization loss
-    # =====================
-    
-    def compute_reg_for_subject(subj_id):
-        mu_s = tf.gather(mu_subj, subj_id, axis=0)
-        L_s = tf.gather(L_subj, subj_id, axis=0)
-        mu_diff = mu_s - mu_pop
-        L_diff = L_s - L_pop
-        mu_reg = tf.reduce_sum(tf.square(mu_diff))
-        L_reg = tf.reduce_sum(tf.square(L_diff))
-        return mu_reg, L_reg
-    
-    mu_regs, L_regs = tf.map_fn(
-        compute_reg_for_subject,
-        unique_subjects,
+    # Run forward pass for all subjects
+    nll_contribs, sids, sum_wus, S_ks, N_ks = tf.map_fn(
+        per_subject_forward,
+        tf.range(S),
         fn_output_signature=(
             tf.TensorSpec(shape=(), dtype=dtype),
-            tf.TensorSpec(shape=(), dtype=dtype)
+            tf.TensorSpec(shape=(), dtype=tf.int32),
+            tf.TensorSpec(shape=(None, None), dtype=dtype),        # (K, D)
+            tf.TensorSpec(shape=(None, None, None), dtype=dtype),  # (K, D, D)
+            tf.TensorSpec(shape=(None,), dtype=dtype),             # (K,)
         )
     )
     
-    total_mu_reg = tf.reduce_sum(mu_regs)
-    total_L_reg = tf.reduce_sum(L_regs)
+    nll = tf.reduce_sum(nll_contribs) / N
+    
+    # =====================
+    # Regularization loss (unchanged, already efficient)
+    # =====================
+    
+    mu_subj_present = tf.gather(mu_subj, unique_subjects, axis=0)
+    L_subj_present = tf.gather(L_subj, unique_subjects, axis=0)
+    
+    mu_diff = mu_subj_present - mu_pop[None, :, :]
+    L_diff = L_subj_present - L_pop[None, :, :, :]
+    
+    total_mu_reg = tf.reduce_sum(tf.square(mu_diff))
+    total_L_reg = tf.reduce_sum(tf.square(L_diff))
     
     scale = tf.cast(S, dtype) / n_subjects
     reg_loss = scale * (lambda_mu / 2.0 * total_mu_reg + lambda_L / 2.0 * total_L_reg)
@@ -342,107 +365,86 @@ def hierarchical_categorical_nll_mean_custom_grad(
     total_loss = nll + reg_loss
     
     # =====================
-    # Custom gradient
+    # Custom gradient using cached values
     # =====================
     
     def grad(dy):
         dy = tf.cast(dy, dtype)
-
-        # Mean over all timepoints => norm = N = B*T
-        # If you want "sum over time, mean over batch", set norm = tf.cast(B, dtype)
-        norm = N
-
-        grad_mu_subj_nll = tf.zeros_like(mu_subj)  # (P,K,D)
-        grad_L_subj_nll  = tf.zeros_like(L_subj)   # (P,K,D,D)
-
-        I = tf.eye(D, dtype=dtype)[None, :, :]     # (1,D,D), will broadcast
-
-        # Loop over unique subjects (handful => OK)
-        # If you later trace this, replace with tf.map_fn over tf.range(S).
-        for i in range(int(unique_subjects.shape[0])):  # eager-friendly
-            start = row_splits[i]
-            stop  = row_splits[i + 1]
-            sid   = unique_subjects[i]  # scalar int32
-
-            x_block = x_sorted[start:stop]         # (N_i, D)
-            g_block = gamma_sorted[start:stop]     # (N_i, K)
-
-            mu_i = tf.gather(mu_subj, sid, axis=0) # (K, D)
-            L_i  = tf.gather(L_subj,  sid, axis=0) # (K, D, D)
-
-            # weights
-            w = g_block / norm                     # (N_i, K)
-
-            # residuals: (N_i, K, D)
-            r = x_block[:, None, :] - mu_i[None, :, :]
-
-            # y = L^{-1} r  -> (N_i, K, D)
-            y = tf.linalg.triangular_solve(L_i[None, ...], r[..., None], lower=True)
-            y = tf.squeeze(y, axis=-1)
-
-            # u = L^{-T} y  -> (N_i, K, D)
-            u = tf.linalg.triangular_solve(
-                tf.linalg.matrix_transpose(L_i)[None, ...],
-                y[..., None],
-                lower=False
-            )
-            u = tf.squeeze(u, axis=-1)
-
-            # ---- mu grad for this subject (K,D)
-            gmu = -tf.einsum("nk,nkd->kd", w, u)  # sum over N_i
-
-            # ---- L grad for this subject (K,D,D)
-            # S_k = sum_n w[n,k] r[n,k] r[n,k]^T
-            S_k = tf.einsum("nk,nkd,nkf->kdf", w, r, r)   # (K,D,D)
-            Nk  = tf.reduce_sum(w, axis=0)                # (K,)
-
-            # LinvT = L^{-T} (K,D,D)
+        
+        I = tf.eye(D, dtype=dtype)
+        
+        def compute_grad_for_subject(i):
+            sid = sids[i]
+            sum_wu_i = sum_wus[i]  # (K, D) - cached
+            S_k_i = S_ks[i]        # (K, D, D) - cached
+            N_k_i = N_ks[i]        # (K,) - cached
+            
+            L_i = tf.gather(L_subj, sid, axis=0)  # (K, D, D)
+            
+            # mu gradient: -sum_wu
+            gmu = -sum_wu_i  # (K, D)
+            
+            # L gradient using cached S_k and N_k
             LinvT = tf.linalg.triangular_solve(
                 tf.linalg.matrix_transpose(L_i),
-                tf.eye(D, dtype=dtype)[None, :, :],
+                I[None, :, :],
                 lower=False
-            )  # (K,D,D)
+            )  # (K, D, D)
+            
+            tmp = tf.linalg.triangular_solve(L_i, S_k_i, lower=True)
+            A = tf.matmul(tmp, LinvT)  # (K, D, D)
+            
+            NI_minus_A = N_k_i[:, None, None] * I[None, :, :] - A
+            gL = tf.matmul(LinvT, NI_minus_A)
+            gL = tf.linalg.band_part(gL, -1, 0)  # lower tri
+            
+            return sid, gmu, gL
 
-            tmp = tf.linalg.triangular_solve(L_i, S_k, lower=True)  # (K,D,D) = L^{-1} S
-            A   = tf.matmul(tmp, LinvT)                             # (K,D,D) = L^{-1} S L^{-T}
+        sids_out, gmus, gLs = tf.map_fn(
+            compute_grad_for_subject,
+            tf.range(S),
+            fn_output_signature=(
+                tf.TensorSpec(shape=(), dtype=tf.int32),
+                tf.TensorSpec(shape=(None, None), dtype=dtype),
+                tf.TensorSpec(shape=(None, None, None), dtype=dtype)
+            )
+        )
 
-            NI_minus_A = Nk[:, None, None] * I - A                  # (K,D,D)
-            gL = tf.matmul(LinvT, NI_minus_A)                       # (K,D,D)
-            gL = tf.linalg.band_part(gL, -1, 0)                     # keep lower tri
+        # Scatter gradients
+        grad_mu_subj_nll = tf.zeros_like(mu_subj)
+        grad_L_subj_nll = tf.zeros_like(L_subj)
+        
+        indices = tf.expand_dims(sids_out, 1)
+        grad_mu_subj_nll = tf.tensor_scatter_nd_add(grad_mu_subj_nll, indices, gmus)
+        grad_L_subj_nll = tf.tensor_scatter_nd_add(grad_L_subj_nll, indices, gLs)
 
-            # scatter-add into full subject tensors
-            idx = tf.reshape(sid, [1, 1])  # shape (1,1)
-            grad_mu_subj_nll = tf.tensor_scatter_nd_add(grad_mu_subj_nll, idx, gmu[None, ...])
-            grad_L_subj_nll  = tf.tensor_scatter_nd_add(grad_L_subj_nll,  idx, gL[None, ...])
-
-        # ---------------------
-        # Regularization grads (same as before)
-        # ---------------------
+        # Regularization gradients
         subject_mask = tf.scatter_nd(
             tf.expand_dims(unique_subjects, 1),
             tf.ones_like(unique_subjects, dtype=dtype),
             [P]
-        )  # (P,)
+        )
 
         reg_scale = scale
-
+        
         grad_mu_subj_reg = lambda_mu * (mu_subj - mu_pop[None, :, :])
         grad_mu_subj_reg *= subject_mask[:, None, None] * reg_scale
 
         grad_L_subj_reg = lambda_L * (L_subj - L_pop[None, :, :, :])
         grad_L_subj_reg *= subject_mask[:, None, None, None] * reg_scale
 
-        grad_mu_subj = dy * (grad_mu_subj_nll + grad_mu_subj_reg)
-        grad_L_subj  = dy * (grad_L_subj_nll  + grad_L_subj_reg)
+        grad_mu_subj_total = dy * (grad_mu_subj_nll + grad_mu_subj_reg)
+        grad_L_subj_total = dy * (grad_L_subj_nll + grad_L_subj_reg)
 
-        # Population grads (from reg only, same as before)
         mu_diff_masked = (mu_subj - mu_pop[None, :, :]) * subject_mask[:, None, None]
         grad_mu_pop = -dy * lambda_mu * tf.reduce_sum(mu_diff_masked, axis=0) * reg_scale
 
         L_diff_masked = (L_subj - L_pop[None, :, :, :]) * subject_mask[:, None, None, None]
         grad_L_pop = -dy * lambda_L * tf.reduce_sum(L_diff_masked, axis=0) * reg_scale
 
-        return (None, grad_mu_pop, grad_L_pop, grad_mu_subj, grad_L_subj, None, None, None, None, None)
+        return (None, grad_mu_pop, grad_L_pop, grad_mu_subj_total, grad_L_subj_total, 
+                None, None, None, None, None)
+    
     return total_loss, grad
 
 
@@ -450,9 +452,6 @@ def hierarchical_categorical_nll_mean_custom_grad(
 def hierarchical_categorical_nll_sum_custom_grad(
     x, mu_pop, L_pop, mu_subj, L_subj, gamma, subject_ids, lambda_mu, lambda_L, n_subjects
 ):
-    """
-    Same as above but with 'sum' reduction over time (mean over batch only).
-    """
     dtype = mu_pop.dtype
     x = tf.cast(x, dtype)
     gamma = tf.cast(gamma, dtype)
@@ -466,22 +465,20 @@ def hierarchical_categorical_nll_sum_custom_grad(
     K = tf.shape(mu_pop)[0]
     P = tf.shape(mu_subj)[0]
     
-    # =====================
-    # Sort subjects by their IDs to break into consecutive segments the data (for emission forward, no need to have consecutive samples)
-    # =====================
+    subject_ids = tf.cast(tf.reshape(subject_ids, [-1]), tf.int32)
+    
     unique_subjects, row_splits, x_sorted, gamma_sorted, _ = sort_and_rowsplit_by_subject(
         x, gamma, subject_ids
     )
 
     N = tf.cast(B, dtype)
-    #N = tf.cast(tf.shape(x_sorted)[0], dtype)
     S = tf.shape(unique_subjects)[0]
     
     # =====================
-    # Forward pass: compute NLL
+    # Forward pass: compute NLL and cache intermediates for backward
     # =====================
-    nll_sum = tf.zeros([], dtype=dtype)  # accumulate total negative log-likelihood numerator
-    def per_subject_ll(i):
+    
+    def per_subject_forward(i):
         start = row_splits[i]
         stop  = row_splits[i + 1]
         sid   = unique_subjects[i]
@@ -492,45 +489,74 @@ def hierarchical_categorical_nll_sum_custom_grad(
         mu_i = tf.gather(mu_subj, sid, axis=0) # (K, D)
         L_i  = tf.gather(L_subj,  sid, axis=0) # (K, D, D)
 
-        mvn = tfp.distributions.MultivariateNormalTriL(
-            loc=mu_i,
-            scale_tril=L_i,
-            allow_nan_stats=False
+        # Residuals: (N_i, K, D)
+        r = x_block[:, None, :] - mu_i[None, :, :]
+        
+        # y = L^{-1} r: (N_i, K, D)
+        y = tf.linalg.triangular_solve(L_i[None, ...], r[..., None], lower=True)
+        y = tf.squeeze(y, axis=-1)
+        
+        # Mahalanobis squared: (N_i, K)
+        mahal_sq = tf.reduce_sum(tf.square(y), axis=-1)
+        
+        # Log det: (K,)
+        log_det = 2.0 * tf.reduce_sum(tf.math.log(tf.linalg.diag_part(L_i)), axis=-1)
+        
+        # Log prob: (N_i, K)
+        log_2pi = tf.cast(tf.math.log(2.0 * np.pi), dtype)
+        D_float = tf.cast(D, dtype)
+        logp = -0.5 * (D_float * log_2pi + log_det[None, :] + mahal_sq)
+        
+        # NLL contribution (scalar)
+        nll_contrib = -tf.reduce_sum(g_block * logp)
+        
+        # Cache for backward: weighted sums we'll need
+        w = g_block / N  # (N_i, K)
+        
+        # For mu gradient: need sum of w * u where u = L^{-T} y
+        u = tf.linalg.triangular_solve(
+            tf.linalg.matrix_transpose(L_i)[None, ...],
+            y[..., None],
+            lower=False
         )
-        logp = mvn.log_prob(x_block[:, None, :])          # (N_i, K)
+        u = tf.squeeze(u, axis=-1)  # (N_i, K, D)
+        sum_wu = tf.einsum("nk,nkd->kd", w, u)  # (K, D)
+        
+        # For L gradient: need sum of w * r * r^T -> (K, D, D)
+        S_k = tf.einsum("nk,nkd,nkf->kdf", w, r, r)
+        
+        # N_k = sum of weights per state: (K,)
+        N_k = tf.reduce_sum(w, axis=0)
+        
+        return nll_contrib, sid, sum_wu, S_k, N_k
 
-        # return NEGATIVE contribution (so we can sum directly)
-        return -tf.reduce_sum(g_block * logp)             # scalar
-
-    nll_sum = tf.reduce_sum(
-        tf.map_fn(per_subject_ll, tf.range(S), fn_output_signature=dtype)
-    )
-    
-    nll = nll_sum/ N
-    # =====================
-    # Regularization loss
-    # =====================
-    
-    def compute_reg_for_subject(subj_id):
-        mu_s = tf.gather(mu_subj, subj_id, axis=0)
-        L_s = tf.gather(L_subj, subj_id, axis=0)
-        mu_diff = mu_s - mu_pop
-        L_diff = L_s - L_pop
-        mu_reg = tf.reduce_sum(tf.square(mu_diff))
-        L_reg = tf.reduce_sum(tf.square(L_diff))
-        return mu_reg, L_reg
-    
-    mu_regs, L_regs = tf.map_fn(
-        compute_reg_for_subject,
-        unique_subjects,
+    # Run forward pass for all subjects
+    nll_contribs, sids, sum_wus, S_ks, N_ks = tf.map_fn(
+        per_subject_forward,
+        tf.range(S),
         fn_output_signature=(
             tf.TensorSpec(shape=(), dtype=dtype),
-            tf.TensorSpec(shape=(), dtype=dtype)
+            tf.TensorSpec(shape=(), dtype=tf.int32),
+            tf.TensorSpec(shape=(None, None), dtype=dtype),        # (K, D)
+            tf.TensorSpec(shape=(None, None, None), dtype=dtype),  # (K, D, D)
+            tf.TensorSpec(shape=(None,), dtype=dtype),             # (K,)
         )
     )
     
-    total_mu_reg = tf.reduce_sum(mu_regs)
-    total_L_reg = tf.reduce_sum(L_regs)
+    nll = tf.reduce_sum(nll_contribs) / N
+    
+    # =====================
+    # Regularization loss (unchanged, already efficient)
+    # =====================
+    
+    mu_subj_present = tf.gather(mu_subj, unique_subjects, axis=0)
+    L_subj_present = tf.gather(L_subj, unique_subjects, axis=0)
+    
+    mu_diff = mu_subj_present - mu_pop[None, :, :]
+    L_diff = L_subj_present - L_pop[None, :, :, :]
+    
+    total_mu_reg = tf.reduce_sum(tf.square(mu_diff))
+    total_L_reg = tf.reduce_sum(tf.square(L_diff))
     
     scale = tf.cast(S, dtype) / n_subjects
     reg_loss = scale * (lambda_mu / 2.0 * total_mu_reg + lambda_L / 2.0 * total_L_reg)
@@ -538,108 +564,85 @@ def hierarchical_categorical_nll_sum_custom_grad(
     total_loss = nll + reg_loss
     
     # =====================
-    # Custom gradient
+    # Custom gradient using cached values
     # =====================
     
     def grad(dy):
         dy = tf.cast(dy, dtype)
-
-        # Mean over all timepoints => norm = N = B*T
-        # If you want "sum over time, mean over batch", set norm = tf.cast(B, dtype)
-        norm = N
-
-        grad_mu_subj_nll = tf.zeros_like(mu_subj)  # (P,K,D)
-        grad_L_subj_nll  = tf.zeros_like(L_subj)   # (P,K,D,D)
-
-        I = tf.eye(D, dtype=dtype)[None, :, :]     # (1,D,D), will broadcast
-
-        # Loop over unique subjects (handful => OK)
-        # If you later trace this, replace with tf.map_fn over tf.range(S).
-        for i in range(int(unique_subjects.shape[0])):  # eager-friendly
-            start = row_splits[i]
-            stop  = row_splits[i + 1]
-            sid   = unique_subjects[i]  # scalar int32
-
-            x_block = x_sorted[start:stop]         # (N_i, D)
-            g_block = gamma_sorted[start:stop]     # (N_i, K)
-
-            mu_i = tf.gather(mu_subj, sid, axis=0) # (K, D)
-            L_i  = tf.gather(L_subj,  sid, axis=0) # (K, D, D)
-
-            # weights
-            w = g_block / norm                     # (N_i, K)
-
-            # residuals: (N_i, K, D)
-            r = x_block[:, None, :] - mu_i[None, :, :]
-
-            # y = L^{-1} r  -> (N_i, K, D)
-            y = tf.linalg.triangular_solve(L_i[None, ...], r[..., None], lower=True)
-            y = tf.squeeze(y, axis=-1)
-
-            # u = L^{-T} y  -> (N_i, K, D)
-            u = tf.linalg.triangular_solve(
-                tf.linalg.matrix_transpose(L_i)[None, ...],
-                y[..., None],
-                lower=False
-            )
-            u = tf.squeeze(u, axis=-1)
-
-            # ---- mu grad for this subject (K,D)
-            gmu = -tf.einsum("nk,nkd->kd", w, u)  # sum over N_i
-
-            # ---- L grad for this subject (K,D,D)
-            # S_k = sum_n w[n,k] r[n,k] r[n,k]^T
-            S_k = tf.einsum("nk,nkd,nkf->kdf", w, r, r)   # (K,D,D)
-            Nk  = tf.reduce_sum(w, axis=0)                # (K,)
-
-            # LinvT = L^{-T} (K,D,D)
+        
+        I = tf.eye(D, dtype=dtype)
+        
+        def compute_grad_for_subject(i):
+            sid = sids[i]
+            sum_wu_i = sum_wus[i]  # (K, D) - cached
+            S_k_i = S_ks[i]        # (K, D, D) - cached
+            N_k_i = N_ks[i]        # (K,) - cached
+            
+            L_i = tf.gather(L_subj, sid, axis=0)  # (K, D, D)
+            
+            # mu gradient: -sum_wu
+            gmu = -sum_wu_i  # (K, D)
+            
+            # L gradient using cached S_k and N_k
             LinvT = tf.linalg.triangular_solve(
                 tf.linalg.matrix_transpose(L_i),
-                tf.eye(D, dtype=dtype)[None, :, :],
+                I[None, :, :],
                 lower=False
-            )  # (K,D,D)
+            )  # (K, D, D)
+            
+            tmp = tf.linalg.triangular_solve(L_i, S_k_i, lower=True)
+            A = tf.matmul(tmp, LinvT)  # (K, D, D)
+            
+            NI_minus_A = N_k_i[:, None, None] * I[None, :, :] - A
+            gL = tf.matmul(LinvT, NI_minus_A)
+            gL = tf.linalg.band_part(gL, -1, 0)  # lower tri
+            
+            return sid, gmu, gL
 
-            tmp = tf.linalg.triangular_solve(L_i, S_k, lower=True)  # (K,D,D) = L^{-1} S
-            A   = tf.matmul(tmp, LinvT)                             # (K,D,D) = L^{-1} S L^{-T}
+        sids_out, gmus, gLs = tf.map_fn(
+            compute_grad_for_subject,
+            tf.range(S),
+            fn_output_signature=(
+                tf.TensorSpec(shape=(), dtype=tf.int32),
+                tf.TensorSpec(shape=(None, None), dtype=dtype),
+                tf.TensorSpec(shape=(None, None, None), dtype=dtype)
+            )
+        )
 
-            NI_minus_A = Nk[:, None, None] * I - A                  # (K,D,D)
-            gL = tf.matmul(LinvT, NI_minus_A)                       # (K,D,D)
-            gL = tf.linalg.band_part(gL, -1, 0)                     # keep lower tri
+        # Scatter gradients
+        grad_mu_subj_nll = tf.zeros_like(mu_subj)
+        grad_L_subj_nll = tf.zeros_like(L_subj)
+        
+        indices = tf.expand_dims(sids_out, 1)
+        grad_mu_subj_nll = tf.tensor_scatter_nd_add(grad_mu_subj_nll, indices, gmus)
+        grad_L_subj_nll = tf.tensor_scatter_nd_add(grad_L_subj_nll, indices, gLs)
 
-            # scatter-add into full subject tensors
-            idx = tf.reshape(sid, [1, 1])  # shape (1,1)
-            grad_mu_subj_nll = tf.tensor_scatter_nd_add(grad_mu_subj_nll, idx, gmu[None, ...])
-            grad_L_subj_nll  = tf.tensor_scatter_nd_add(grad_L_subj_nll,  idx, gL[None, ...])
-
-        # ---------------------
-        # Regularization grads (same as before)
-        # ---------------------
+        # Regularization gradients
         subject_mask = tf.scatter_nd(
             tf.expand_dims(unique_subjects, 1),
             tf.ones_like(unique_subjects, dtype=dtype),
             [P]
-        )  # (P,)
+        )
 
         reg_scale = scale
-
+        
         grad_mu_subj_reg = lambda_mu * (mu_subj - mu_pop[None, :, :])
         grad_mu_subj_reg *= subject_mask[:, None, None] * reg_scale
 
         grad_L_subj_reg = lambda_L * (L_subj - L_pop[None, :, :, :])
         grad_L_subj_reg *= subject_mask[:, None, None, None] * reg_scale
 
-        grad_mu_subj = dy * (grad_mu_subj_nll + grad_mu_subj_reg)
-        grad_L_subj  = dy * (grad_L_subj_nll  + grad_L_subj_reg)
+        grad_mu_subj_total = dy * (grad_mu_subj_nll + grad_mu_subj_reg)
+        grad_L_subj_total = dy * (grad_L_subj_nll + grad_L_subj_reg)
 
-        # Population grads (from reg only, same as before)
         mu_diff_masked = (mu_subj - mu_pop[None, :, :]) * subject_mask[:, None, None]
         grad_mu_pop = -dy * lambda_mu * tf.reduce_sum(mu_diff_masked, axis=0) * reg_scale
 
         L_diff_masked = (L_subj - L_pop[None, :, :, :]) * subject_mask[:, None, None, None]
         grad_L_pop = -dy * lambda_L * tf.reduce_sum(L_diff_masked, axis=0) * reg_scale
 
-        return (None, grad_mu_pop, grad_L_pop, grad_mu_subj, grad_L_subj, None, None, None, None, None)
-
+        return (None, grad_mu_pop, grad_L_pop, grad_mu_subj_total, grad_L_subj_total, 
+                None, None, None, None, None)
     
     return total_loss, grad
 
@@ -734,7 +737,7 @@ class HierarchicalModel(Model):
 
     config_type = HierarchicalConfig
     
-    def set_trans_prob(self, trans_prob_subj):
+    def set_trans_prob(self, trans_prob_subj, subject_id=None):
         """Sets the transition probability matrix.
 
         Parameters
@@ -743,14 +746,18 @@ class HierarchicalModel(Model):
             State transition probabilities. Shape must be (n_subjects, n_states, n_states).
         """
         if trans_prob_subj is None:
-            trans_prob_subj = (
-                np.ones((self.n_subjects, self.config.n_states, self.config.n_states))
-                * 0.1
-                / (self.config.n_states - 1)
-            )
-            for i in range(self.n_subjects):
-                np.fill_diagonal(trans_prob_subj[i], 0.9)
-        self.trans_prob_subj = trans_prob_subj
+            if subject_id is None:
+                trans_prob_subj = (
+                    np.ones((self.config.n_subjects, self.config.n_states, self.config.n_states))
+                    * 0.1
+                    / (self.config.n_states - 1)
+                )
+                for i in range(self.config.n_subjects):
+                    np.fill_diagonal(trans_prob_subj[i], 0.9)
+                self.trans_prob_subj = trans_prob_subj
+
+            else:
+                self.trans_prob_subj[subject_id] = trans_prob_subj
         
         
     def set_state_probs_t0(self, state_probs_t0_subj):
@@ -775,29 +782,14 @@ class HierarchicalModel(Model):
         self.set_state_probs_t0(self.config.state_probs_t0_subj)
     
     def __init__(self, config):
-        super().__init__(config)
-        
         # Population transition probability
-        self.trans_prob_pop = None
+        #self.trans_prob_pop = None
         
         # Subject-specific transition probabilities (M matrices)
-        self.trans_prob_subj = [None] * config.n_subjects
+        #self.trans_prob_subj = [None] * config.n_subjects
+        super().__init__(config)
         
-    def set_trans_prob(self, trans_prob, subject_id=None):
-        """
-        Set transition probability matrix.
         
-        Parameters
-        ----------
-        trans_prob : np.ndarray
-            Transition probability matrix
-        subject_id : int, optional
-            If None, set population matrix. Otherwise set subject-specific matrix.
-        """
-        if subject_id is None:
-            self.trans_prob_pop = trans_prob
-        else:
-            self.trans_prob_subj[subject_id] = trans_prob
 
     def get_trans_prob(self, subject_id=None):
         """Get transition probability matrix."""
@@ -914,6 +906,103 @@ class HierarchicalModel(Model):
         
         model = tf.keras.Model(inputs=inputs, outputs=[ll_loss], name="HierarchicalHMM")
         return model
+        
+    def get_observation_model_parameter_tensor(self, layer_name):
+        """Get the parameter of an observation model layer, in tensor form.
+
+        Parameters
+        ----------
+        model : osl_dynamics.models.*.Model.model
+            The model.
+        layer_name : str
+            Name of the layer of the observation model parameter.
+
+        Returns
+        -------
+        obs_parameter : tf.tensor
+            The observation model parameter.
+        """
+        available_layers = [
+            "means",
+            "covs",
+            "stds",
+            "corrs",
+            "group_means",
+            "group_covs",
+            "log_rates",
+            "trils"
+        ]
+        isin = np.array([(layer_name in layer) or (layer in layer_name) for layer in available_layers])
+        if not np.any(isin):
+            raise ValueError(
+                f"Layer name {layer_name} not in available layers {available_layers}."
+            )
+        obs_layer = self.model.get_layer(layer_name)
+        obs_parameter = obs_layer(1)
+        return obs_parameter
+
+    def set_observation_model_parameter(
+        self,
+        obs_parameter,
+        layer_name,
+        update_initializer=True,
+        diagonal_covariances=False,
+        ):
+        """Set the value of an observation model parameter.
+
+        Parameters
+        ----------
+        model : osl_dynamics.models.*.Model.model
+            The model.
+        obs_parameter : np.ndarray
+            The value of the observation model parameter to set.
+        layer_name : str
+            Layer name of the observation model parameter.
+        update_initializer : bool, optional
+            Whether to update the initializer of the layer.
+        diagonal_covariances : bool, optional
+            Whether the covariances are diagonal.
+            Ignored if :code:`layer_name` is not :code:`"covs"`.
+        """
+        available_layers = [
+            "means",
+            "covs",
+            "stds",
+            "corrs",
+            "group_means",
+            "group_covs",
+            "log_rates",
+            "trils"
+        ]
+        from osl_dynamics.inference.initializers import (
+            WeightInitializer,
+            RandomWeightInitializer,
+            )
+        isin = np.array([(layer_name in layer) or (layer in layer_name) for layer in available_layers])
+        if not np.any(isin):
+            raise ValueError(
+                f"Layer name {layer_name} not in available layers {available_layers}."
+            )
+        if layer_name != "trils":
+            obs_parameter = obs_parameter.astype(np.float32)
+
+        if layer_name == "stds" or (layer_name == "covs" and diagonal_covariances):
+            if obs_parameter.ndim == 3:
+                # Only keep the diagonal as a vector
+                obs_parameter = np.diagonal(obs_parameter, axis1=1, axis2=2)
+
+        obs_layer = self.model.get_layer(layer_name)
+        learnable_tensor_layer = obs_layer.layers[0]
+
+        if layer_name not in ["means", "group_means", "log_rates"]:
+            #print(obs_parameter.shape)
+            obs_parameter = obs_layer.bijector.inverse(obs_parameter)
+
+        learnable_tensor_layer.tensor.assign(obs_parameter)
+
+        if update_initializer:
+            learnable_tensor_layer.tensor_initializer = WeightInitializer(obs_parameter)
+
     
     def get_means_subj(self, tensor=False):
         """Get the state means.
@@ -924,16 +1013,16 @@ class HierarchicalModel(Model):
             State means. Shape is (n_states, n_channels).
         """
         if tensor:
-            return [obs_mod.get_observation_model_parameter_tensor(self.model, f"means_subj_{m}") for m in range(self.config.n_subjects)]
+            return tf.stack([self.get_observation_model_parameter_tensor(f"means_subj_{m}") for m in range(self.config.n_subjects)],axis=0)
         else:
-            return [obs_mod.get_observation_model_parameter(self.model, f"means_subj_{m}") for m in range(self.config.n_subjects)]
+            return [self.get_observation_model_parameter(f"means_subj_{m}") for m in range(self.config.n_subjects)]
     
     
     def get_trils_subj(self, tensor=False):
         if tensor:
-            return [obs_mod.get_observation_model_parameter_tensor(self.model,f"trils_subj_{m}") for m in range(self.config.n_subjects)]
+            return tf.stack([self.get_observation_model_parameter_tensor(f"trils_subj_{m}") for m in range(self.config.n_subjects)],axis=0)
         else:    
-            return [obs_mod.get_observation_model_parameter(self.model,f"trils_subj_{m}") for m in range(self.config.n_subjects)]
+            return [self.get_observation_model_parameter(f"trils_subj_{m}") for m in range(self.config.n_subjects)]
         
     def get_means_pop(self, tensor=False):
         """Get the state means.
@@ -944,19 +1033,129 @@ class HierarchicalModel(Model):
             State means. Shape is (n_states, n_channels).
         """
         if tensor:
-            return obs_mod.get_observation_model_parameter_tensor(self.model, "means_pop")
+            return self.get_observation_model_parameter_tensor("means_pop")
         else:
-            return obs_mod.get_observation_model_parameter(self.model, "means_pop")
+            return self.get_observation_model_parameter("means_pop")
     
     def get_trils_pop(self, tensor=False):
         if tensor:
-            return obs_mod.get_observation_model_parameter_tensor(self.model,"trils_pop")
+            return self.get_observation_model_parameter_tensor("trils_pop")
         else:    
-            return obs_mod.get_observation_model_parameter(self.model,"trils_pop")
+            return self.get_observation_model_parameter("trils_pop")
         
     
     def get_log_likelihood_graph_hierarchical(self, means_subj, means_pop, trils_subj, trils_pop, data):
         pass
+    
+    def sort_and_rowsplit_by_subject(self, x, gamma_or_none, subject_ids):
+        """
+        x: (B,T,D)
+        subject_ids: (B,T) int
+        Returns:
+        unique_subjects: (S,)
+        row_splits: (S+1,)
+        x_sorted: (N,D)
+        (optional) gamma_sorted: (N,K) or None
+        perm: (N,) permutation indices s.t. x_sorted = x_flat[perm]
+        inv_perm: (N,) inverse permutation s.t. x_flat = x_sorted[inv_perm]
+        """
+        x = tf.convert_to_tensor(x)
+        subject_ids = tf.convert_to_tensor(subject_ids, tf.int32)
+
+        B = tf.shape(x)[0]
+        T = tf.shape(x)[1]
+        D = tf.shape(x)[2]
+        N = B * T
+
+        x_flat = tf.reshape(x, [N, D])
+        sid_flat = tf.reshape(subject_ids, [N])
+
+        perm = tf.argsort(sid_flat, stable=True)
+        sid_sorted = tf.gather(sid_flat, perm)
+        x_sorted = tf.gather(x_flat, perm)
+
+        if gamma_or_none is not None:
+            g = tf.reshape(gamma_or_none, [N, tf.shape(gamma_or_none)[-1]])
+            gamma_sorted = tf.gather(g, perm)
+        else:
+            gamma_sorted = None
+
+        # segment boundaries
+        unique_subjects, first_idx = tf.unique(sid_sorted)  # NOTE: tf.unique keeps first occurrence order
+        # But sid_sorted is sorted, so unique_subjects will also be sorted. Good.
+
+        # Build row_splits from counts
+        # counts per unique id
+        # (fast way) use tf.math.bincount with minlength=max+1 then gather,
+        # but P might be large; simplest:
+        is_new = tf.concat([[True], sid_sorted[1:] != sid_sorted[:-1]], axis=0)
+        boundaries = tf.where(is_new)[:, 0]  # indices where new segment starts
+        # boundaries includes 0
+        row_splits = tf.concat([boundaries, [N]], axis=0)  # (S+1,)
+
+        # unique_subjects should match sid_sorted[row_splits[:-1]]
+        unique_subjects = tf.gather(sid_sorted, row_splits[:-1])
+
+        inv_perm = tf.argsort(perm, stable=True)
+        return unique_subjects, row_splits, x_sorted, gamma_sorted, perm, inv_perm
+
+
+    def hierarchical_logB(self,
+        x, subject_ids, mu_subj, L_subj
+    ):
+        """
+        x: (B,T,D) (or (N,D) if you adapt)
+        subject_ids: (B,T)
+        mu_subj: (P,K,D)
+        L_subj: (P,K,D,D)
+        returns logB: (B,T,K)
+        """
+        dtype = mu_subj.dtype
+        x = tf.cast(x, dtype)
+        subject_ids = tf.cast(subject_ids, tf.int32)
+
+        B = tf.shape(x)[0]
+        T = tf.shape(x)[1]
+        D = tf.shape(x)[2]
+        K = tf.shape(mu_subj)[1]
+        N = B * T
+
+        unique_subjects, row_splits, x_sorted, _, perm, inv_perm = self.sort_and_rowsplit_by_subject(
+            x, None, subject_ids
+        )
+        S = tf.shape(unique_subjects)[0]
+
+        # compute logB in sorted order, per subject block
+        logB_sorted =  tf.TensorArray(
+                        dtype=dtype,
+                        size=S,
+                        infer_shape=False,                    # key
+                        element_shape=tf.TensorShape([None, None])  # (N_i, K) where N_i varies
+                    )
+
+        for i in tf.range(S):
+            start = row_splits[i]
+            stop  = row_splits[i + 1]
+            sid = unique_subjects[i]
+
+            x_block = x_sorted[start:stop]           # (N_i, D)
+            mu_i = tf.gather(mu_subj, sid, axis=0)   # (K, D)
+            L_i  = tf.gather(L_subj,  sid, axis=0)   # (K, D, D)
+
+            mvn = tfd.MultivariateNormalTriL(loc=mu_i, scale_tril=L_i, allow_nan_stats=False)
+
+            # broadcast: x_block[:,None,:] is (N_i,1,D) -> log_prob (N_i,K)
+            logp = mvn.log_prob(x_block[:, None, :])  # (N_i, K)
+            
+            logB_sorted = logB_sorted.write(i, logp)
+
+        logB_sorted = logB_sorted.concat() #tf.concat(logB_sorted.stack(), axis=0)  # (N,K) in sorted order
+
+        # unsort back to original flat order
+        logB_flat = tf.gather(logB_sorted, inv_perm)          # (N,K)
+        logB = tf.reshape(logB_flat, [B, T, K])  # (B,T,K)
+        return logB
+
     
     def get_log_likelihood_hierarchical(self, data, subject_ids):
         r"""Get the log-likelihood of data, :math:`\log p(x_t | s_t)`.
@@ -975,12 +1174,10 @@ class HierarchicalModel(Model):
         
         # Get all parameters (population + subjects)
         means_subj = self.get_means_subj(tensor=True)
-        means_pop = self.get_means_pop(tensor=True)
         
         L_subj = self.get_trils_subj(tensor=True)
-        L_pop = self.get_trils_pop(tensor=True)
         
-        return self.get_log_likelihood_graph_hierarchical(means_subj, means_pop, L_subj, L_pop,data).numpy()
+        return  self.hierarchical_logB(data, subject_ids[:,:,0], means_subj, L_subj).numpy()
     
     def get_posterior(self, x, subj_ids):
         """Get marginal and joint posterior.
@@ -1009,6 +1206,7 @@ class HierarchicalModel(Model):
         log_B = self.get_log_likelihood_hierarchical(x, subj_ids)
         batch_size, sequence_length, n_states = log_B.shape
         log_B = log_B.transpose(2, 0, 1).reshape(n_states, -1).T
+        subj_ids = tf.reshape(subj_ids, [-1])
         gamma, xi = self.baum_welch_log_optimized_hierarchical(log_B, Pi_0_subjs, P_subjs, subj_ids)
         return gamma,xi
     
@@ -1148,6 +1346,8 @@ class HierarchicalModel(Model):
         # This is so that batches will maintain proper ordering between the two arrays seamlessly.
         assert len(dataset.arrays) == len(subject_ids), "Dataset and subject IDs should contain the same number of arrays"
         dataset.arrays = [np.concatenate((dataset.arrays[i],subject_ids[i][:,None]),axis=1) for i in range(len(dataset.arrays))]
+        
+        #print("Dataset array shape", dataset.arrays[0].shape)
     
         dataset = self.make_dataset(dataset, shuffle=False, concatenate=True)
         gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
@@ -1197,8 +1397,11 @@ class HierarchicalModel(Model):
             occupancies = []
             for element in dataset:
                 x_tot = self._unpack_inputs(element)
-                subj_ids = tf.cast(x_tot[:,-1], tf.uint32) # Cast to unsigned int 32
-                x = x_tot[:,:-1]
+                subj_ids = tf.cast(x_tot[:,:,-1:], tf.uint32) # Cast to unsigned int 32
+                x = x_tot[:,:,:-1]
+                
+                #print("X.shape", x.shape)
+                #print("subj_ids.shape", subj_ids.shape)
                 
                 # Get the gamma tcs, which must account for subject IDs
                 gamma, xi_sum = self.get_posterior(x,subj_ids)
@@ -1219,7 +1422,9 @@ class HierarchicalModel(Model):
                 gamma = tf.convert_to_tensor(gamma, dtype=tf.float32)
                 # Update observation model
                 
-                # TODO: figure out how to pass here the subj_ids as well !
+                x = tf.cast(x, tf.float32)
+                #print(x.dtype)
+                #print(gamma.dtype)
                 x_and_gamma = tf.concat([x, gamma], axis=2)
                 h = None
                 #end_other = time.time()
