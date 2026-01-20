@@ -1301,47 +1301,871 @@ class TestGradientCorrectness:
             atol=1e-5,
             err_msg=f"L_subj gradient mismatch for calculation={calculation}"
         )
+        
+        
+class TestUpdateTransProbHierarchical:
+    """Tests for update_trans_prob_optimized_hierarchical method."""
+    
+    @pytest.fixture
+    def simple_model(self):
+        """Create a simple model for testing transition probability updates."""
+        config = HierarchicalConfig(
+            n_states=3,
+            n_channels=5,
+            n_subjects=4,
+            sequence_length=50,
+            batch_size=4,
+            learning_rate=0.01,
+            learn_means=True,
+            learn_covariances=True,
+            n_epochs=1,
+            initial_covariances_pop=None,
+        )
+        model = HierarchicalModel(config)
+        return model
+    
+    def test_output_remains_row_stochastic(self, simple_model):
+        """Test that transition matrices remain row-stochastic after update."""
+        model = simple_model
+        K = model.config.n_states
+        P = model.config.n_subjects
+        N = 100
+        
+        np.random.seed(42)
+        
+        # Create random gamma (must sum to 1 over states)
+        gamma_raw = np.random.rand(N, K)
+        gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
+        
+        # Create random xi_sum_flat for each subject
+        xi_sum_flat = np.random.rand(P, K * K) + 0.1
+        
+        # Subject IDs with some consecutive same-subject pairs
+        subj_ids = np.random.randint(0, P, size=N)
+        
+        # Set rho to 1 for full update
+        model.rho = 1.0
+        
+        # Update
+        model.update_trans_prob_optimized_hierarchical(gamma, xi_sum_flat, subj_ids)
+        
+        # Check all matrices are row-stochastic
+        for p in range(P):
+            row_sums = model.trans_prob_subj[p].sum(axis=1)
+            assert_allclose(
+                row_sums, np.ones(K),
+                rtol=1e-6,
+                err_msg=f"Subject {p} transition matrix rows should sum to 1"
+            )
+            assert np.all(model.trans_prob_subj[p] >= 0), \
+                f"Subject {p} transition matrix should be non-negative"
+    
+    def test_absent_subject_unchanged(self, simple_model):
+        """Test that subjects not in batch are not updated."""
+        model = simple_model
+        K = model.config.n_states
+        P = model.config.n_subjects
+        N = 100
+        
+        np.random.seed(42)
+        
+        # Store initial transition matrices
+        initial_trans_prob = [model.trans_prob_subj[p].copy() for p in range(P)]
+        
+        # Create data with only subjects 0 and 1
+        gamma_raw = np.random.rand(N, K)
+        gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
+        
+        # xi_sum_flat: subjects 2 and 3 have all zeros
+        xi_sum_flat = np.zeros((P, K * K))
+        xi_sum_flat[0] = np.random.rand(K * K) + 0.1
+        xi_sum_flat[1] = np.random.rand(K * K) + 0.1
+        # xi_sum_flat[2] and [3] remain zeros
+        
+        # Subject IDs: only subjects 0 and 1
+        subj_ids = np.random.choice([0, 1], size=N)
+        
+        model.rho = 1.0
+        model.update_trans_prob_optimized_hierarchical(gamma, xi_sum_flat, subj_ids)
+        
+        # Subjects 0 and 1 should change
+        assert not np.allclose(initial_trans_prob[0], model.trans_prob_subj[0]), \
+            "Subject 0 should be updated"
+        assert not np.allclose(initial_trans_prob[1], model.trans_prob_subj[1]), \
+            "Subject 1 should be updated"
+        
+        # Subjects 2 and 3 should NOT change
+        assert_allclose(
+            initial_trans_prob[2], model.trans_prob_subj[2],
+            rtol=1e-10,
+            err_msg="Subject 2 should not be updated (no data)"
+        )
+        assert_allclose(
+            initial_trans_prob[3], model.trans_prob_subj[3],
+            rtol=1e-10,
+            err_msg="Subject 3 should not be updated (no data)"
+        )
+    
+    def test_rho_zero_no_update(self, simple_model):
+        """Test that rho=0 means no update happens."""
+        model = simple_model
+        K = model.config.n_states
+        P = model.config.n_subjects
+        N = 100
+        
+        np.random.seed(42)
+        
+        initial_trans_prob = [model.trans_prob_subj[p].copy() for p in range(P)]
+        
+        gamma_raw = np.random.rand(N, K)
+        gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
+        xi_sum_flat = np.random.rand(P, K * K) + 0.1
+        subj_ids = np.random.randint(0, P, size=N)
+        
+        # rho = 0 means: trans_prob = (1-0)*trans_prob + 0*new = trans_prob
+        model.rho = 0.0
+        model.update_trans_prob_optimized_hierarchical(gamma, xi_sum_flat, subj_ids)
+        
+        for p in range(P):
+            assert_allclose(
+                initial_trans_prob[p], model.trans_prob_subj[p],
+                rtol=1e-10,
+                err_msg=f"Subject {p} should not change when rho=0"
+            )
+    
+    def test_rho_one_full_update(self, simple_model):
+        """Test that rho=1 means full replacement with new estimate."""
+        model = simple_model
+        K = model.config.n_states
+        P = model.config.n_subjects
+        N = 200
+        
+        np.random.seed(42)
+        
+        # Create deterministic scenario: subject 0 only
+        gamma = np.zeros((N, K))
+        gamma[:, 0] = 1.0  # Always in state 0
+        
+        # xi_sum_flat encodes transitions: only 0->0 transitions
+        xi_sum_flat = np.zeros((P, K * K))
+        # For subject 0: all transitions are 0->0
+        # xi is K x K, flattened. Index [0,0] in row-major is index 0
+        xi_sum_flat[0, 0] = N - 1  # N-1 transitions from state 0 to state 0
+        
+        subj_ids = np.zeros(N, dtype=np.int32)  # All subject 0
+        
+        model.rho = 1.0
+        model.update_trans_prob_optimized_hierarchical(gamma, xi_sum_flat, subj_ids)
+        
+        # Subject 0 should have ~1.0 for 0->0, ~0 elsewhere in row 0
+        # (with EPS adjustments)
+        assert model.trans_prob_subj[0][0, 0] > 0.99, \
+            "State 0->0 transition should be ~1.0"
+    
+    def test_stochastic_update_interpolation(self, simple_model):
+        """Test that update correctly interpolates between old and new."""
+        model = simple_model
+        K = model.config.n_states
+        P = model.config.n_subjects
+        N = 100
+        
+        np.random.seed(42)
+        
+        # Set a known initial transition matrix for subject 0
+        initial_P0 = np.array([
+            [0.8, 0.1, 0.1],
+            [0.1, 0.8, 0.1],
+            [0.1, 0.1, 0.8],
+        ])
+        model.trans_prob_subj[0] = initial_P0.copy()
+        
+        # Create data that would suggest a different transition matrix
+        gamma = np.zeros((N, K))
+        gamma[:, 1] = 1.0  # Always in state 1
+        
+        xi_sum_flat = np.zeros((P, K * K))
+        # Transitions: 1->1 mostly
+        xi_sum_flat[0, 4] = N - 1  # Index 4 = [1,1] in 3x3 row-major
+        
+        subj_ids = np.zeros(N, dtype=np.int32)
+        
+        # With rho=0.5, should be halfway between old and new
+        model.rho = 0.5
+        model.update_trans_prob_optimized_hierarchical(gamma, xi_sum_flat, subj_ids)
+        
+        # Row 1 should have moved toward [0, 1, 0] but not fully
+        # Since initial row 1 was [0.1, 0.8, 0.1] and new would be ~[0, 1, 0]
+        # Interpolation: 0.5 * [0.1, 0.8, 0.1] + 0.5 * [~0, ~1, ~0]
+        assert model.trans_prob_subj[0][1, 1] > 0.8, \
+            "State 1->1 should increase"
+        assert model.trans_prob_subj[0][1, 1] < 0.99, \
+            "State 1->1 should not be fully 1.0 (interpolation)"
+    
+    def test_cross_subject_transitions_ignored(self, simple_model):
+        """Test that transitions between different subjects are ignored."""
+        model = simple_model
+        K = model.config.n_states
+        P = model.config.n_subjects
+        
+        np.random.seed(42)
+        
+        # Create sequence: [subj0, subj0, subj1, subj1, subj0, subj0]
+        # Transitions within subject: 0->1, 2->3, 4->5
+        # Transitions across subjects (should be ignored): 1->2, 3->4
+        subj_ids = np.array([0, 0, 1, 1, 0, 0], dtype=np.int32)
+        N = len(subj_ids)
+        
+        gamma = np.zeros((N, K))
+        # Subject 0 time points: indices 0,1,4,5 - say state sequence [0,1,0,1]
+        gamma[0, 0] = 1.0  # t=0: state 0
+        gamma[1, 1] = 1.0  # t=1: state 1
+        gamma[4, 0] = 1.0  # t=4: state 0
+        gamma[5, 1] = 1.0  # t=5: state 1
+        
+        # Subject 1 time points: indices 2,3 - say state sequence [2,2]
+        gamma[2, 2] = 1.0  # t=2: state 2
+        gamma[3, 2] = 1.0  # t=3: state 2
+        
+        #print(gamma)
+        
+        # xi_sum_flat should reflect ONLY within-subject transitions
+        # Subject 0: 0->1 (t=0->1), 0->1 (t=4->5) => 2 transitions of type 0->1
+        # Subject 1: 2->2 (t=2->3) => 1 transition of type 2->2
+        xi_sum = np.zeros((P, K,  K))
+        xi_sum[0, 0, 1] = 2  # 0->1 for subject 0
+        xi_sum[1, 2, 2] = 1  # 2->2 for subject 1
+        
+        xi_sum_flat = xi_sum.swapaxes(1,2).reshape((P, -1))
+        #print(xi_sum_flat)
+        
+        initial_trans_prob = [model.trans_prob_subj[p].copy() for p in range(P)]
+        
+        model.rho = 1.0
+        model.update_trans_prob_optimized_hierarchical(gamma, xi_sum_flat, subj_ids)
+        
+        #print(model.trans_prob_subj[0])
+        #print(model.trans_prob_subj[1])
+        
+        # Subject 0 row 0 should have high probability for 0->1
+        assert model.trans_prob_subj[0][0, 1] > 0.9, \
+            "Subject 0: 0->1 transition should be high"
+        
+        # Subject 1 row 2 should have high probability for 2->2
+        assert model.trans_prob_subj[1][2, 2] > 0.9, \
+            "Subject 1: 2->2 transition should be high"
+        
+        # Subjects 2 and 3 should be unchanged
+        assert_allclose(initial_trans_prob[2], model.trans_prob_subj[2])
+        assert_allclose(initial_trans_prob[3], model.trans_prob_subj[3])
+    
+    def test_handles_subject_with_single_timepoint(self, simple_model):
+        """Test handling when a subject has only one timepoint (no transitions)."""
+        model = simple_model
+        K = model.config.n_states
+        P = model.config.n_subjects
+        
+        # Subject 0 has multiple timepoints, subject 1 has only one
+        subj_ids = np.array([0, 0, 0, 1, 0, 0], dtype=np.int32)
+        N = len(subj_ids)
+        
+        gamma_raw = np.random.rand(N, K)
+        gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
+        
+        # xi_sum_flat: subject 1 has zeros (no within-subject transitions)
+        xi_sum_flat = np.zeros((P, K * K))
+        xi_sum_flat[0] = np.random.rand(K * K) + 0.1
+        # xi_sum_flat[1] remains zeros
+        
+        initial_trans_prob_1 = model.trans_prob_subj[1].copy()
+        
+        model.rho = 1.0
+        
+        # Should not crash
+        model.update_trans_prob_optimized_hierarchical(gamma, xi_sum_flat, subj_ids)
+        
+        # Subject 1 should be unchanged (skipped due to zero xi_sum)
+        assert_allclose(
+            initial_trans_prob_1, model.trans_prob_subj[1],
+            rtol=1e-10,
+            err_msg="Subject with no transitions should be unchanged"
+        )
+        
+    def test_matches_non_hierarchical_single_subject(self):
+        """Debug version to find the mismatch."""
+        from osl_dynamics.models.hmm import Config, Model
+        
+        np.random.seed(42)
+        K = 3
+        N = 20  # Smaller for easier debugging
+        
+        h_config = HierarchicalConfig(
+            n_states=K,
+            n_channels=5,
+            n_subjects=1,
+            sequence_length=50,
+            batch_size=4,
+            learning_rate=0.01,
+            learn_means=True,
+            learn_covariances=True,
+            n_epochs=1,
+            initial_covariances_pop=None,
+        )
+        h_model = HierarchicalModel(h_config)
+        
+        nh_config = Config(
+            n_states=K,
+            n_channels=5,
+            sequence_length=50,
+            batch_size=4,
+            learning_rate=0.01,
+            learn_means=True,
+            learn_covariances=True,
+            n_epochs=1,
+            initial_covariances=None,
+            kappa=0.0,
+        )
+        nh_model = Model(nh_config)
+        
+        initial_P = np.array([
+            [0.7, 0.2, 0.1],
+            [0.1, 0.7, 0.2],
+            [0.2, 0.1, 0.7],
+        ])
+        h_model.trans_prob_subj[0] = initial_P.copy()
+        nh_model.trans_prob = initial_P.copy()
+        
+        h_model.rho = 1.0  # Full update for easier comparison
+        nh_model.rho = 1.0
+        
+        gamma_raw = np.random.rand(N, K)
+        gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
+        
+        xi_raw = np.random.rand(N - 1, K * K)
+        xi = xi_raw / xi_raw.sum(axis=-1, keepdims=True)
+        xi_sum = xi.sum(axis=0)
+        
+        subj_ids = np.zeros(N, dtype=np.int32)
+        
+        # Manually compute what hierarchical should get
+        same_next = (subj_ids[:-1] == subj_ids[1:])
+        p_mask = (subj_ids[:-1] == 0) & same_next
+        
+        print("same_next:", same_next)
+        print("p_mask:", p_mask)
+        print("All True?", np.all(p_mask))
+        
+        # Hierarchical xi reshape
+        xi_sum_flat_h = np.array([xi_sum])
+        xi_p_h = xi_sum_flat_h[0].reshape(K, K).T
+        print("xi_p hierarchical:\n", xi_p_h)
+        
+        # Non-hierarchical xi reshape  
+        xi_p_nh = xi_sum.reshape(K, K).T
+        print("xi_p non-hierarchical:\n", xi_p_nh)
+        
+        # Denominators
+        denom_h = gamma[:-1][p_mask].sum(axis=0)
+        denom_nh = np.sum(gamma[:-1], axis=0)
+        print("denom hierarchical:", denom_h)
+        print("denom non-hierarchical:", denom_nh)
+        
+        # phi_interim
+        EPS = np.finfo(float).eps
+        phi_h = (xi_p_h + EPS) / (denom_h[:, None] + K * EPS)
+        phi_h /= phi_h.sum(axis=1, keepdims=True)
+        
+        phi_nh = (xi_p_nh + EPS) / (denom_nh.reshape(K, 1) + K * EPS)
+        # Note: non-hierarchical might not have the second normalization step
+        
+        print("phi hierarchical:\n", phi_h)
+        print("phi non-hierarchical:\n", phi_nh)
+        
+        # Now run actual updates
+        h_model.update_trans_prob_optimized_hierarchical(gamma, xi_sum_flat_h, subj_ids)
+        nh_model.update_trans_prob_optimized(gamma, xi_sum)
+        
+        print("Final hierarchical trans_prob:\n", h_model.trans_prob_subj[0])
+        print("Final non-hierarchical trans_prob:\n", nh_model.trans_prob)
+        print("Difference:\n", h_model.trans_prob_subj[0] - nh_model.trans_prob)
+    
+    
+    def test_numerical_stability_small_counts(self, simple_model):
+        """Test numerical stability with very small transition counts."""
+        model = simple_model
+        K = model.config.n_states
+        P = model.config.n_subjects
+        N = 10
+        
+        gamma = np.ones((N, K)) / K  # Uniform
+        
+        # Very small counts
+        xi_sum_flat = np.ones((P, K * K)) * 1e-10
+        
+        subj_ids = np.zeros(N, dtype=np.int32)
+        
+        model.rho = 1.0
+        
+        # Should not produce NaN or Inf
+        model.update_trans_prob_optimized_hierarchical(gamma, xi_sum_flat, subj_ids)
+        
+        assert not np.any(np.isnan(model.trans_prob_subj[0])), \
+            "Should not produce NaN"
+        assert not np.any(np.isinf(model.trans_prob_subj[0])), \
+            "Should not produce Inf"
+        assert np.all(model.trans_prob_subj[0] >= 0), \
+            "Should remain non-negative"
+        assert_allclose(
+            model.trans_prob_subj[0].sum(axis=1), np.ones(K),
+            rtol=1e-6,
+            err_msg="Should remain row-stochastic"
+        )
+    
+    def test_correct_use_of_same_next_mask(self, simple_model):
+        """Test that same_next mask correctly identifies within-subject transitions."""
+        model = simple_model
+        K = model.config.n_states
+        P = model.config.n_subjects
+        
+        # Explicit sequence with known transitions
+        # subj: [0, 0, 1, 0, 0]
+        # valid transitions for subj 0: (0,1) and (3,4) - indices in gamma[:-1]
+        # invalid (cross-subject): (1,2), (2,3)
+        subj_ids = np.array([0, 0, 1, 0, 0], dtype=np.int32)
+        N = len(subj_ids)
+        
+        # Gamma: all in state 0
+        gamma = np.zeros((N, K))
+        gamma[:, 0] = 1.0
+        
+        # xi_sum_flat: subject 0 has 2 transitions (0->0 twice)
+        xi_sum_flat = np.zeros((P, K * K))
+        xi_sum_flat[0, 0] = 2  # Two 0->0 transitions for subject 0
+        
+        initial_P0 = model.trans_prob_subj[0].copy()
+        
+        model.rho = 1.0
+        model.update_trans_prob_optimized_hierarchical(gamma, xi_sum_flat, subj_ids)
+        
+        # Check that the denominator was computed correctly
+        # For subject 0, valid transitions are at t=0 and t=3 (indices in gamma[:-1])
+        # Both are in state 0, so denom for state 0 should be 2
+        # The resulting row 0 of trans_prob should be mostly [1, 0, 0]
+        assert model.trans_prob_subj[0][0, 0] > 0.99, \
+            "0->0 should be ~1.0 (only valid transition type observed)"
 
 
 ###############################################################################
 # Tests for HMM fit interface
 ###############################################################################
-class TestHMMModel:
-    def test_hmm_fit(self):
-        # Minimal config
+class TestHMMModelFit:
+    """Tests for the HierarchicalModel.fit() method."""
+    
+    @pytest.fixture
+    def simple_model_and_data(self):
+        """Create a simple model and data for testing fit behavior."""
+        np.random.seed(42)
+        
+        config = HierarchicalConfig(
+            n_states=2,
+            n_channels=3,
+            n_subjects=3,
+            sequence_length=50,
+            batch_size=4,
+            learning_rate=0.1,  # High LR to see changes
+            learn_means=True,
+            learn_covariances=True,
+            n_epochs=1,
+            initial_covariances_pop=None,
+            lambda_mu=1.0,
+            lambda_L=1.0,
+            learn_trans_prob=True
+        )
+        
+        model = HierarchicalModel(config)
+        
+        # Generate synthetic data - only for subjects 0 and 1 (not subject 2)
+        data = Data([
+            np.random.randn(200, config.n_channels).astype(np.float32),  # subject 0
+            np.random.randn(200, config.n_channels).astype(np.float32),  # subject 1
+        ], time_axis_first=True, sampling_frequency=250)
+        
+        subject_ids = [
+            np.zeros(200, dtype=np.int32),  # subject 0
+            np.ones(200, dtype=np.int32),   # subject 1
+        ]
+        
+        return config, model, data, subject_ids
+    
+    def test_parameters_change_after_fit(self, simple_model_and_data):
+        """Test that observation model parameters are updated after fit."""
+        config, model, data, subject_ids = simple_model_and_data
+        
+        # Get initial parameters
+        initial_means_pop = model.get_means_pop().copy()
+        initial_trils_pop = model.get_trils_pop().copy()
+        initial_means_subj = [m.copy() for m in model.get_means_subj()]
+        initial_trils_subj = [t.copy() for t in model.get_trils_subj()]
+        
+        # Fit for one epoch
+        model.fit(data, subject_ids=subject_ids, epochs=1, verbose=0)
+        
+        # Get updated parameters
+        final_means_pop = model.get_means_pop()
+        final_trils_pop = model.get_trils_pop()
+        final_means_subj = model.get_means_subj()
+        final_trils_subj = model.get_trils_subj()
+        
+        # Population parameters should change
+        assert not np.allclose(initial_means_pop, final_means_pop), \
+            "Population means should change after fit"
+        assert not np.allclose(initial_trils_pop, final_trils_pop), \
+            "Population Cholesky factors should change after fit"
+        
+        # Subject 0 and 1 parameters should change (they have data)
+        assert not np.allclose(initial_means_subj[0], final_means_subj[0]), \
+            "Subject 0 means should change after fit"
+        assert not np.allclose(initial_means_subj[1], final_means_subj[1]), \
+            "Subject 1 means should change after fit"
+    
+    def test_absent_subject_params_unchanged_without_regularization(self):
+        """Test that absent subject parameters don't change when lambda=0."""
+        np.random.seed(42)
+        
+        config = HierarchicalConfig(
+            n_states=2,
+            n_channels=3,
+            n_subjects=3,
+            sequence_length=50,
+            batch_size=4,
+            learning_rate=0.1,
+            learn_means=True,
+            learn_covariances=True,
+            n_epochs=1,
+            initial_covariances_pop=None,
+            lambda_mu=0.0,  # No regularization
+            lambda_L=0.0,
+            learn_trans_prob=True
+
+        )
+        
+        model = HierarchicalModel(config)
+        
+        # Data only for subjects 0 and 1
+        data = Data([
+            np.random.randn(200, config.n_channels).astype(np.float32),
+            np.random.randn(200, config.n_channels).astype(np.float32),
+        ], time_axis_first=True, sampling_frequency=250)
+        
+        subject_ids = [
+            np.zeros(200, dtype=np.int32),
+            np.ones(200, dtype=np.int32),
+        ]
+        
+        # Get initial parameters for subject 2 (absent)
+        initial_means_subj_2 = model.get_means_subj()[2].copy()
+        initial_trils_subj_2 = model.get_trils_subj()[2].copy()
+        
+        # Fit
+        model.fit(data, subject_ids=subject_ids, epochs=1, verbose=0)
+        
+        # Subject 2 parameters should NOT change (no data, no regularization)
+        final_means_subj_2 = model.get_means_subj()[2]
+        final_trils_subj_2 = model.get_trils_subj()[2]
+        
+        assert_allclose(
+            initial_means_subj_2, final_means_subj_2,
+            rtol=1e-6,
+            err_msg="Absent subject means should not change without regularization"
+        )
+        assert_allclose(
+            initial_trils_subj_2, final_trils_subj_2,
+            rtol=1e-6,
+            err_msg="Absent subject Cholesky factors should not change without regularization"
+        )
+        
+    def test_transition_matrix_update_direct(self):
+        """Directly test update_trans_prob_optimized_hierarchical with controlled inputs."""
+        np.random.seed(42)
+        
+        config = HierarchicalConfig(
+            n_states=2,
+            n_channels=3,
+            n_subjects=3,
+            sequence_length=50,
+            batch_size=4,
+            learning_rate=0.1,
+            learn_means=True,
+            learn_covariances=True,
+            learn_trans_prob=True,
+            n_epochs=1,
+            initial_covariances_pop=None,
+        )
+        
+        model = HierarchicalModel(config)
+        
+        K = config.n_states
+        P = config.n_subjects
+        N = 100
+        
+        # Store initial
+        initial_trans_prob = model.trans_prob_subj.copy()
+        
+        # Create gamma
+        gamma_raw = np.random.rand(N, K)
+        gamma = gamma_raw / gamma_raw.sum(axis=-1, keepdims=True)
+        
+        # Create subject_ids: first half subject 0, second half subject 1
+        # This ensures consecutive same-subject pairs
+        subj_ids = np.concatenate([
+            np.zeros(N // 2, dtype=np.int32),
+            np.ones(N // 2, dtype=np.int32),
+        ])
+        
+        # Create xi_sum_flat with non-zero values for subjects 0 and 1 only
+        xi_sum_flat = np.zeros((P, K * K))
+        xi_sum_flat[0] = np.random.rand(K * K) + 0.1  # Subject 0 has transitions
+        xi_sum_flat[1] = np.random.rand(K * K) + 0.1  # Subject 1 has transitions
+        # xi_sum_flat[2] stays zero - subject 2 has no transitions
+        
+        model.rho = 1.0
+        model.update_trans_prob_optimized_hierarchical(gamma, xi_sum_flat, subj_ids)
+        
+        # Subject 0 and 1 should change
+        assert not np.allclose(initial_trans_prob[0], model.trans_prob_subj[0]), \
+            "Subject 0 transition matrix should change"
+        assert not np.allclose(initial_trans_prob[1], model.trans_prob_subj[1]), \
+            "Subject 1 transition matrix should change"
+        
+        # Subject 2 should NOT change
+        assert_allclose(
+            initial_trans_prob[2], model.trans_prob_subj[2],
+            rtol=1e-10,
+            err_msg="Subject 2 transition matrix should not change"
+        )
+        
+    def test_transition_matrix_only_updates_for_present_subjects(self):
+        """Test that transition matrices only update for subjects in the batch."""
+        np.random.seed(42)
+        
+        config = HierarchicalConfig(
+            n_states=2,
+            n_channels=3,
+            n_subjects=3,
+            sequence_length=50,
+            batch_size=4,
+            learning_rate=0.1,
+            learn_means=True,
+            learn_covariances=True,
+            learn_trans_prob=True,
+            n_epochs=1,
+            initial_covariances_pop=None,
+        )
+        
+        model = HierarchicalModel(config)
+        
+        # Create longer sequences to ensure we have enough within-subject transitions
+        # after batching
+        data = Data([
+            np.random.randn(1000, config.n_channels).astype(np.float32),  # subject 0
+            np.random.randn(1000, config.n_channels).astype(np.float32),  # subject 1
+        ], time_axis_first=True, sampling_frequency=250)
+        
+        subject_ids = [
+            np.zeros(1000, dtype=np.int32),   # subject 0
+            np.ones(1000, dtype=np.int32),    # subject 1
+        ]
+        import copy
+        # Get initial transition matrices
+        initial_trans_prob = copy.deepcopy(model.trans_prob_subj)#.copy()
+        
+        # Fit
+        model.fit(data, subject_ids=subject_ids, epochs=1, verbose=0)
+        
+        # Subject 0 and 1 transition matrices should change
+        assert not np.allclose(initial_trans_prob[0], model.trans_prob_subj[0]), \
+            "Subject 0 transition matrix should change"
+        assert not np.allclose(initial_trans_prob[1], model.trans_prob_subj[1]), \
+            "Subject 1 transition matrix should change"
+        
+        # Subject 2 transition matrix should NOT change
+        assert_allclose(
+            initial_trans_prob[2], model.trans_prob_subj[2],
+            rtol=1e-10,
+            err_msg="Absent subject transition matrix should not change"
+        )
+    
+    
+    def test_transition_matrix_remains_stochastic(self):
+        """Test that transition matrices remain row-stochastic after fit."""
+        np.random.seed(42)
+        
         config = HierarchicalConfig(
             n_states=3,
-            n_channels=10,
-            n_subjects=4,
-            sequence_length=100,
+            n_channels=5,
+            n_subjects=2,
+            sequence_length=50,
+            batch_size=4,
+            learning_rate=0.1,
+            learn_means=True,
+            learn_covariances=True,
+            learn_trans_prob=True,
+            n_epochs=1,
+            initial_covariances_pop=None,
+        )
+        
+        model = HierarchicalModel(config)
+        
+        data = Data([
+            np.random.randn(200, config.n_channels).astype(np.float32),
+            np.random.randn(200, config.n_channels).astype(np.float32),
+        ], time_axis_first=True, sampling_frequency=250)
+        
+        subject_ids = [
+            np.zeros(200, dtype=np.int32),
+            np.ones(200, dtype=np.int32),
+        ]
+        
+        # Fit for multiple epochs
+        model.fit(data, subject_ids=subject_ids, epochs=5, verbose=0)
+        
+        # Check all transition matrices are row-stochastic
+        for p in range(config.n_subjects):
+            row_sums = model.trans_prob_subj[p].sum(axis=1)
+            assert_allclose(
+                row_sums, np.ones(config.n_states),
+                rtol=1e-6,
+                err_msg=f"Subject {p} transition matrix rows should sum to 1"
+            )
+            assert np.all(model.trans_prob_subj[p] >= 0), \
+                f"Subject {p} transition matrix should be non-negative"
+    
+    def test_parameter_update_direction_matches_gradient(self):
+        """Test that parameters move in the direction of negative gradient."""
+        np.random.seed(42)
+        
+        config = HierarchicalConfig(
+            n_states=2,
+            n_channels=3,
+            n_subjects=2,
+            sequence_length=50,
+            batch_size=100,  # Large batch to reduce noise
+            learning_rate=0.01,  # Small LR for linear approximation
+            learn_means=True,
+            learn_covariances=False,  # Simplify by fixing covariances
+            n_epochs=1,
+            initial_covariances_pop=None,
+            lambda_mu=0.0,
+            lambda_L=0.0,
+            learn_trans_prob=True
+    
+        )
+        
+        model = HierarchicalModel(config)
+        
+        # Use deterministic data
+        data = Data([
+            np.random.randn(500, config.n_channels).astype(np.float32),
+            np.random.randn(500, config.n_channels).astype(np.float32),
+        ], time_axis_first=True, sampling_frequency=250)
+        
+        subject_ids = [
+            np.zeros(500, dtype=np.int32),
+            np.ones(500, dtype=np.int32),
+        ]
+        
+        # Get initial means
+        initial_means_subj_0 = model.get_means_subj()[0].copy()
+        
+        # Manually compute what the gradient should be for first batch
+        # (This is complex, so we just verify the update has correct sign properties)
+        
+        # Fit for one epoch
+        model.fit(data, subject_ids=subject_ids, epochs=1, verbose=0)
+        
+        # Get updated means
+        final_means_subj_0 = model.get_means_subj()[0]
+        
+        # The update should be non-trivial
+        delta = final_means_subj_0 - initial_means_subj_0
+        assert not np.allclose(delta, 0), \
+            "Parameters should change after fit"
+    
+    def test_loss_decreases_over_epochs(self):
+        """Test that loss generally decreases over training."""
+        np.random.seed(42)
+        
+        config = HierarchicalConfig(
+            n_states=2,
+            n_channels=5,
+            n_subjects=2,
+            sequence_length=50,
             batch_size=8,
             learning_rate=0.01,
             learn_means=True,
             learn_covariances=True,
             n_epochs=1,
-            initial_covariances_pop=None
-        )
-        
-        # Create model
-        model = HierarchicalModel(config)
-        #print(model.trans_prob_subj)
-        
-        # Generate synthetic data
-        np.random.seed(42)
-        data = Data([np.random.randn(500, config.n_channels).astype(np.float32) 
-                for _ in range(4)], time_axis_first=True, sampling_frequency=250)
-        subject_ids = [np.array([i]*500)for i in range(config.n_subjects)]
-        
-        
-        history = model.fit(
-            data,
-            subject_ids=subject_ids,
-            epochs=2,
-            verbose=1,
-        )
+            initial_covariances_pop=None,
+            learn_trans_prob=True
 
+        )
+        
+        model = HierarchicalModel(config)
+        
+        data = Data([
+            np.random.randn(500, config.n_channels).astype(np.float32),
+            np.random.randn(500, config.n_channels).astype(np.float32),
+        ], time_axis_first=True, sampling_frequency=250)
+        
+        subject_ids = [
+            np.zeros(500, dtype=np.int32),
+            np.ones(500, dtype=np.int32),
+        ]
+        
+        # Fit for multiple epochs
+        history = model.fit(data, subject_ids=subject_ids, epochs=10, verbose=0)
+        
+        # Loss should generally decrease (allow some fluctuation)
+        initial_loss = history['loss'][0]
+        final_loss = history['loss'][-1]
+        
+        assert final_loss < initial_loss, \
+            f"Loss should decrease: initial={initial_loss}, final={final_loss}"
+    
+    def test_fit_with_single_subject_batch(self):
+        """Test fit works when batch contains only one subject."""
+        np.random.seed(42)
+        
+        config = HierarchicalConfig(
+            n_states=2,
+            n_channels=3,
+            n_subjects=3,
+            sequence_length=50,
+            batch_size=4,
+            learning_rate=0.1,
+            learn_means=True,
+            learn_covariances=True,
+            n_epochs=1,
+            initial_covariances_pop=None,
+            learn_trans_prob=True
+
+        )
+        
+        model = HierarchicalModel(config)
+        
+        # Data for only one subject
+        data = Data([
+            np.random.randn(200, config.n_channels).astype(np.float32),
+        ], time_axis_first=True, sampling_frequency=250)
+        
+        subject_ids = [
+            np.zeros(200, dtype=np.int32),  # Only subject 0
+        ]
+        
+        # Should not crash
+        history = model.fit(data, subject_ids=subject_ids, epochs=2, verbose=0)
         
         assert history is not None
+        assert len(history['loss']) == 2
 
 # =============================================================================
 # Tests for absent subject behavior

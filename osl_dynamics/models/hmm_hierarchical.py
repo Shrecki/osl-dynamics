@@ -941,6 +941,9 @@ class HierarchicalModel(Model):
         obs_parameter = obs_layer(1)
         return obs_parameter
 
+    def get_observation_model_parameter(self, layer_name):
+        return self.get_observation_model_parameter_tensor(layer_name).numpy()
+
     def set_observation_model_parameter(
         self,
         obs_parameter,
@@ -1222,12 +1225,27 @@ class HierarchicalModel(Model):
         
         # Get xi_sum DIRECTLY
         log_xi_sum = _hmmc.compute_log_xi_sum_hierarchical(fwdlattice, P_subjs, bwdlattice, log_B,subj_ids)
-        xi_sum = np.exp(log_xi_sum)  # Shape: (N_subj, K, K)
+        # Normalize log_xi_sum per subject before exponentiating to avoid underflow
+        # For each subject p, normalize across all K*K entries
+        N_subj, K, _ = log_xi_sum.shape
+        xi_sum = np.zeros_like(log_xi_sum)
         
-        N_subj = xi_sum.shape[0]
+        for p in range(N_subj):
+            log_xi_p = log_xi_sum[p]  # (K, K)
+            
+            # Check if all -inf (subject not present)
+            if np.all(np.isinf(log_xi_p)):
+                xi_sum[p] = 0.0  # Keep as zeros
+            else:
+                # Log-sum-exp normalization to get valid probabilities
+                log_xi_flat = log_xi_p.flatten()
+                max_log = np.max(log_xi_flat[~np.isinf(log_xi_flat)])  # Max of non-inf values
+                xi_p_unnorm = np.exp(log_xi_p - max_log)  # Shift to avoid underflow
+                xi_sum[p] = xi_p_unnorm  # Keep unnormalized counts (will be normalized in update_trans_prob)
         
         # Reshape to match expected format: (N_subj, K*K)
         xi_sum_flat = np.swapaxes(xi_sum, 1, 2).reshape((N_subj, -1))
+        
         
         return gamma, xi_sum_flat
     
@@ -1237,29 +1255,29 @@ class HierarchicalModel(Model):
         return mat / np.maximum(s, eps)
     
  
-    def update_trans_prob_optimized_hierarchical(self, gamma, xi_sum_flat,subj_ids):
+    def update_trans_prob_optimized_hierarchical(self, gamma, xi_sum_flat, subj_ids):
         """Updated to work with pre-summed xi."""
+        subj_ids = np.asarray(subj_ids).reshape(-1)
         
-        same_next = (subj_ids[:-1] == subj_ids[1:])          # shape (N-1,)
+        same_next = (subj_ids[:-1] == subj_ids[1:])
         K = self.config.n_states
+        
         for p in range(self.config.n_subjects):
-            if(np.all(xi_sum_flat[p]==0)):
-                continue # We can't update this subject: empty transition counts everywhere
+            if np.all(xi_sum_flat[p] == 0):
+                continue
             else:
                 p_mask = (subj_ids[:-1] == p) & same_next
-                # xi_sum_flat is already summed over time, just reshape
-                xi_p = xi_sum_flat[p].reshape(K, K).T            # (K,K)
-                denom = gamma[:-1][p_mask].sum(axis=0)           # (K,)
-
-                phi_interim = (xi_p + EPS) / (denom[:, None] + K * EPS)  # (K,K), row-wise normalization “in expectation”
-                # Ensure exact row stochastic
-                phi_interim /= phi_interim.sum(axis=1, keepdims=True)
-
                 
-                # Stochastic update of transition matrix
-                self.trans_prob[p] = (1 - self.rho) * self.trans_prob[p] + self.rho * phi_interim
-                self.trans_prob[p] /= self.trans_prob[p].sum(axis=1, keepdims=True)
-    
+                xi_p = xi_sum_flat[p].reshape(K, K).T
+                denom = gamma[:-1][p_mask].sum(axis=0)
+                
+                phi_interim = (xi_p + EPS) / (denom[:, None] + K * EPS)
+                phi_interim /= phi_interim.sum(axis=1, keepdims=True)
+                
+                old_trans = self.trans_prob_subj[p].copy()
+                self.trans_prob_subj[p] = (1 - self.rho) * self.trans_prob_subj[p] + self.rho * phi_interim
+                self.trans_prob_subj[p] /= self.trans_prob_subj[p].sum(axis=1, keepdims=True)
+        
     def fit(
         self,
         dataset,
@@ -1408,7 +1426,12 @@ class HierarchicalModel(Model):
 
                 # Update transition probability matrix
                 if self.config.learn_trans_prob:
-                    self.update_trans_prob_optimized_hierarchical(gamma, xi_sum, subj_ids)
+                    s = subj_ids.numpy().reshape(-1)
+                    #print("Updating")
+                    #print("xi sum", xi_sum.shape)
+                    #print("gamma", gamma.shape)
+                    #print("subj ids", s.shape)
+                    self.update_trans_prob_optimized_hierarchical(gamma, xi_sum, s)
 
                 # Calculate fractional occupancy
                 #stc = modes.argmax_time_courses(gamma)
