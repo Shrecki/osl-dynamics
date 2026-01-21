@@ -1993,6 +1993,8 @@ class TestHMMModelFit:
             rtol=1e-10,
             err_msg="Absent subject transition matrix should not change"
         )
+        
+        model.get_alpha(data, subject_ids)
     
     
     def test_transition_matrix_remains_stochastic(self):

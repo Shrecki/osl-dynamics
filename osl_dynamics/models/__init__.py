@@ -4,8 +4,8 @@
 
 import yaml
 
-import importlib
-_hmmc = importlib.import_module("osl_dynamics.models._hmmc")
+#import importlib
+#_hmmc = importlib.import_module("osl_dynamics.models._hmmc")
 
 from osl_dynamics.models import (
     dynemo,

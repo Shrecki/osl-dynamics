@@ -19,6 +19,8 @@ from osl_dynamics.inference.layers import (
     CholeskyFactorsLayer
 )
 
+from copy import copy
+
 import numba
 import numpy as np
 import tensorflow as tf
@@ -1363,11 +1365,12 @@ class HierarchicalModel(Model):
         # Here fuse the subject IDs with the data such that last channel = subject IDs
         # This is so that batches will maintain proper ordering between the two arrays seamlessly.
         assert len(dataset.arrays) == len(subject_ids), "Dataset and subject IDs should contain the same number of arrays"
-        dataset.arrays = [np.concatenate((dataset.arrays[i],subject_ids[i][:,None]),axis=1) for i in range(len(dataset.arrays))]
+        dataset_ = copy(dataset)
+        dataset_.arrays = [np.concatenate((dataset.arrays[i],subject_ids[i][:,None]),axis=1) for i in range(len(dataset.arrays))]
         
         #print("Dataset array shape", dataset.arrays[0].shape)
     
-        dataset = self.make_dataset(dataset, shuffle=False, concatenate=True)
+        dataset = self.make_dataset(dataset_, shuffle=False, concatenate=True)
         gpu_info = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"])
         gpu_memory_used = gpu_info.decode("utf-8").split("\n")[0]
         _logger.info(f"GPU memory used after make dataset: {gpu_memory_used} MB")
@@ -1417,6 +1420,9 @@ class HierarchicalModel(Model):
                 x_tot = self._unpack_inputs(element)
                 subj_ids = tf.cast(x_tot[:,:,-1:], tf.uint32) # Cast to unsigned int 32
                 x = x_tot[:,:,:-1]
+                
+                print(x.shape)
+                print(subj_ids.shape)
                 
                 #print("X.shape", x.shape)
                 #print("subj_ids.shape", subj_ids.shape)
@@ -1529,3 +1535,90 @@ class HierarchicalModel(Model):
             _range.close()
 
         return history
+    
+    def get_alpha(self, dataset, subject_ids, concatenate=False, remove_edge_effects=False):
+        """Get state probabilities.
+
+        Parameters
+        ----------
+        dataset : tf.data.Dataset or osl_dynamics.data.Data
+            Prediction dataset. This can be a list of datasets, one for
+            each session.
+        subject_ids: list of np.ndarray
+            Sample membership for each timepoint of each subject's dataset, to the group of choice for hierarchical modeling.
+        concatenate : bool, optional
+            Should we concatenate alpha for each session?
+        remove_edge_effects : bool, optional
+            Edge effects can arise due to separating the data into sequences.
+            We can remove these by predicting overlapping :code:`alpha` and
+            disregarding the :code:`alpha` near the ends. Passing :code:`True`
+            does this by using sequences with 50% overlap and throwing away the
+            first and last 25% of predictions.
+
+        Returns
+        -------
+        alpha : list or np.ndarray
+            State probabilities with shape (n_sessions, n_samples, n_states)
+            or (n_samples, n_states).
+        """
+        if remove_edge_effects:
+            step_size = self.config.sequence_length // 2  # 50% overlap
+            trim = step_size // 2  # throw away 25%
+        else:
+            step_size = None
+
+        sampling_freq = dataset.sampling_frequency
+        assert len(dataset.arrays) == len(subject_ids), "Dataset and subject IDs should contain the same number of arrays"
+        dataset_ = copy(dataset)
+        dataset_.arrays = [np.concatenate((dataset.arrays[i],subject_ids[i][:,None]),axis=1) for i in range(len(dataset.arrays))]
+        dataset = self.make_dataset(dataset_, step_size=step_size)
+
+        n_datasets = len(dataset)
+        if len(dataset) > 1:
+            iterator = trange(n_datasets, desc="Getting alpha")
+        else:
+            iterator = range(n_datasets)
+            _logger.info("Getting alpha")
+
+
+        alpha = []
+        for i in iterator:
+            gamma = []
+            j = 0
+            for data in dataset[i]:
+                n_batches = dtf.get_n_batches(dataset[i])
+                
+                x_tot  = self._unpack_inputs(data)
+
+                subj_ids = tf.cast(x_tot[:,:,-1:], tf.uint32) # Cast to unsigned int 32
+                print("X tot", x_tot.shape)
+                x = x_tot[:,:,:-1]
+                print(subj_ids.shape)
+                print(x.shape)
+                #x = data["data"]
+                g, _ = self.get_posterior(x, subj_ids)
+                if remove_edge_effects:
+                    batch_size, sequence_length, _ = x.shape
+                    n_states = g.shape[-1]
+                    g = g.reshape(batch_size, sequence_length, n_states)
+                    if j == 0:
+                        g = [
+                            g[0, :-trim],
+                            g[1:, trim:-trim].reshape(-1, n_states),
+                        ]
+                    elif j == n_batches - 1:
+                        g = [
+                            g[:-1, trim:-trim].reshape(-1, n_states),
+                            g[-1, trim:],
+                        ]
+                    else:
+                        g = [g[:, trim:-trim].reshape(-1, n_states)]
+                    g = np.concatenate(g).reshape(-1, n_states)
+                gamma.append(g)
+                j += 1
+            alpha.append(np.concatenate(gamma).astype(np.float32))
+
+        if concatenate or len(alpha) == 1:
+            alpha = np.concatenate(alpha)
+
+        return alpha
